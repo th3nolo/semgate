@@ -85,10 +85,23 @@ Also seen now (added after 0.4.2):
 Still only a human gate (ask): the target itself in a variable (`rm -rf "$DIR/"`,
 `rm -rf "$DIR"/*`) - a legitimate build script writes this with $DIR set, so a
 hard deny would block real work; the ask still catches the empty-variable wipe.
+
+outside_project_hit is the sibling rule (default-on, also before the judge): a
+destructive command whose target is OUTSIDE the project folder is a hard deny,
+so "clean node_modules" cannot delete the global one. The catastrophic rule
+above denies a target that is a root or the home folder in the absolute; this
+rule denies a target outside the box the agent was given. It covers deletes
+(rm, unlink, del, find -delete, the library deletes, Remove-Item), moves and
+copies (mv, cp: the destination), and a truncating `>` redirect; an append
+`>>` and every read are left alone. The boundary is project_root, then cwd;
+the scratch and cache folders real dev touches are allowed (/tmp, $TMPDIR,
+~/.cache, ~/.npm, ~/.cargo, ...). It uses _scope_resolve, where a bare `/p` is
+an ordinary folder, not the C: drive.
 """
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 from typing import List, Optional, Sequence, Tuple
 
@@ -339,10 +352,16 @@ def _expand_braces(word: str) -> List[str]:
     return out
 
 
-def _resolve(word: str, cwd: Optional[str]) -> Optional[str]:
+def _resolve(word: str, cwd: Optional[str], bare_drive: bool = True) -> Optional[str]:
     """The absolute path a target word names, with the home folder at HOME
     and a Windows drive at /mnt/<letter>. None when it depends on a folder
-    that is not known (a relative path with no known cwd, ~-)."""
+    that is not known (a relative path with no known cwd, ~-).
+
+    bare_drive maps a bare `/c` to the C: drive (Git Bash), which the
+    catastrophic check wants (`rm -rf /c` is a drive wipe). The project-scope
+    check passes bare_drive=False: there `/p` is an ordinary folder (a project
+    root), not a drive, and the boundary and the targets must resolve the same
+    way or an in-project path looks outside."""
     w = word.strip().replace("\\", "/")
     if not w:
         return None
@@ -361,8 +380,9 @@ def _resolve(word: str, cwd: Optional[str]) -> Optional[str]:
             user = re.match(r"^~([A-Za-z0-9._][A-Za-z0-9._-]*)(/.*)?$", w)
             if user:
                 w = "/home/" + user.group(1) + (user.group(2) or "")
-    drive = (re.match(r"^([A-Za-z]):(/.*)?$", w) or re.match(r"^/cygdrive/([A-Za-z])(/.*)?$", w, re.IGNORECASE)
-             or re.match(r"^/([A-Za-z])(/.*)?$", w))
+    drive = re.match(r"^([A-Za-z]):(/.*)?$", w) or re.match(r"^/cygdrive/([A-Za-z])(/.*)?$", w, re.IGNORECASE)
+    if drive is None and bare_drive:
+        drive = re.match(r"^/([A-Za-z])(/.*)?$", w)
     if drive:
         w = "/mnt/" + drive.group(1).lower() + (drive.group(2) or "")
     if not w.startswith("/"):
@@ -372,7 +392,7 @@ def _resolve(word: str, cwd: Optional[str]) -> Optional[str]:
         # resolve it the same way, so `rm -rf *` run from the home folder is
         # seen. A bare `/c/...` cwd is left as written: `/p` (a project root)
         # is a directory, not the C: drive, and a false hard deny is worse.
-        base = _resolve(cwd, None) if (re.match(r"^[A-Za-z]:", cwd) or "\\" in cwd) else cwd
+        base = _resolve(cwd, None, bare_drive) if (re.match(r"^[A-Za-z]:", cwd) or "\\" in cwd) else cwd
         w = (base or cwd) + "/" + w
     parts: List[str] = []
     for comp in w.split("/"):
@@ -384,6 +404,12 @@ def _resolve(word: str, cwd: Optional[str]) -> Optional[str]:
             continue
         parts.append(comp)
     return "/" + "/".join(parts)
+
+
+def _scope_resolve(word: str, cwd: Optional[str]) -> Optional[str]:
+    """_resolve for the project-scope check: a bare `/p` stays `/p`, so the
+    boundary and the targets are in one space."""
+    return _resolve(word, cwd, bare_drive=False)
 
 
 def _matches(comp: str, names) -> bool:
@@ -778,21 +804,28 @@ _CODE_HOME_RE = re.compile(
 _CODE_LITERAL_RE = re.compile(r"""(['"`])(.*?)\1""")
 
 
-def _code_arg_catastrophic(arg: str) -> bool:
-    """The first argument of a delete call names a catastrophic target: a string
-    literal like "/" or "~" (single, double or backtick quotes), a home-folder
-    expression, or a literal wrapped in a path constructor (Path::new("/"),
-    new File("/"), PathBuf::from("/"))."""
+def _code_arg_path(arg: str) -> Optional[str]:
+    """The path a delete call's first argument names: a string literal (single,
+    double or backtick quotes), "~" for a home-folder expression, or the literal
+    wrapped in a path constructor (Path::new("/"), new File("/")). None when the
+    argument is a variable or otherwise not a literal."""
     arg = arg.strip()
     if not arg:
-        return False
+        return None
     if arg[0] in "'\"`":
         end = arg.find(arg[0], 1)
-        return end > 0 and is_catastrophic(arg[1:end])
+        return arg[1:end] if end > 0 else None
     if _CODE_HOME_RE.match(arg):
-        return True
+        return "~"
     m = _CODE_LITERAL_RE.search(arg)
-    return bool(m) and is_catastrophic(m.group(2))
+    return m.group(2) if m else None
+
+
+def _code_arg_catastrophic(arg: str) -> bool:
+    """True when the delete call's first argument names a catastrophic target
+    (a root or the home folder)."""
+    p = _code_arg_path(arg)
+    return bool(p) and is_catastrophic(p)
 
 
 def _shq(word: str) -> str:
@@ -990,3 +1023,254 @@ def catastrophic_hit(command: str, cwd: Optional[str] = None) -> str:
     if not isinstance(command, str) or not command.strip() or not _mentions(command):
         return ""
     return _all_hit(command, 0, cwd)
+
+
+# ---------------------------------------------------------------- outside the project
+
+# A destructive command whose target is outside the project folder is a hard
+# deny by default: a tired person could approve "clean node_modules" that turns
+# out to delete the global one. This is the catastrophic floor's sibling - the
+# catastrophic rule denies a target that is a root or the home folder in the
+# absolute; this rule denies a target outside the box the agent was given, with
+# an allowlist for the scratch and cache folders real dev work touches. Deletes,
+# moves, copies over a file, and a truncating `>` redirect count; reads never do.
+
+# Scratch folders a destructive op may touch outside the project.
+_SCRATCH_DIRS = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", "/dev/shm")
+# Package / build caches under the home folder (resolved to /home/~/<name>).
+_HOME_CACHE = (".cache", ".npm", ".yarn", ".pnpm-store", ".gradle", ".m2", ".cargo", ".rustup",
+               ".gem", ".nuget", ".ivy2", ".composer", ".local/share/virtualenvs", ".local/share/pnpm")
+
+_DELETE_CMDS = DELETE_PROGRAMS | {"del", "erase"}
+_MOVE_CMDS = frozenset({"mv", "move", "move-item", "mi"})
+_COPY_CMDS = frozenset({"cp", "copy", "copy-item", "cpi"})
+_TRUNC_RE = re.compile(r"^\d*>\|?$")                    # >  1>  2>  >|  (not >>, not >&)
+_DESTRUCTIVE_WORDS = ("rm", "unlink", "shred", "del", "erase", "mv", "move", "cp", "copy",
+                      "remove-item", "find", "removeall", "rmtree", "remove_tree", "rimraf", "removesync")
+
+
+def _plain_targets(args: Sequence[str]) -> List[str]:
+    """Non-option words of a delete command (rm, unlink, del ...), option
+    parsing stopping at `--`."""
+    done, targets = False, []
+    for a in args:
+        if not done and a == "--":
+            done = True
+            continue
+        if not done and a.startswith("-") and len(a) > 1:
+            continue
+        targets.append(a)
+    return targets
+
+
+def _powershell_targets(args: Sequence[str]) -> List[str]:
+    targets, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        low = a.lower()
+        if low in _PS_RECURSE or low in _PS_PATH_OPTS:
+            continue
+        if low in _PS_VALUE_OPTS:
+            skip = True
+            continue
+        if a.startswith("-"):
+            continue
+        targets.append(a)
+    return targets
+
+
+def _mv_cp_dest(args: Sequence[str]) -> List[str]:
+    for i, a in enumerate(args):
+        if a in ("-t", "--target-directory") and i + 1 < len(args):
+            return [args[i + 1]]
+        if a.startswith("--target-directory="):
+            return [a.split("=", 1)[1]]
+    non = [a for a in args if not (a.startswith("-") and len(a) > 1)]
+    return non[-1:] if non else []                      # the destination is the last operand
+
+
+def _find_deletes(expr: Sequence[str], depth: int) -> bool:
+    if "-delete" in expr:
+        return True
+    for k, e in enumerate(expr):
+        if e in ("-exec", "-execdir", "-ok", "-okdir"):
+            body = []
+            for w in expr[k + 1:]:
+                if w in (";", "\\;", "+"):
+                    break
+                body.append(w)
+            if any(p in DELETE_PROGRAMS or p in _MOVE_CMDS or p in _COPY_CMDS for p in _programs_of(body, depth)):
+                return True
+    return False
+
+
+def _op_target_words(prog: str, argv: Sequence[str], args: Sequence[str], depth: int) -> List[Tuple[str, str]]:
+    if prog in _DELETE_CMDS:
+        return [(w, "delete") for w in _plain_targets(args)]
+    if prog in POWERSHELL_DELETE:
+        return [(w, "delete") for w in _powershell_targets(args)]
+    if prog in _MOVE_CMDS:
+        return [(w, "move") for w in _mv_cp_dest(args)]
+    if prog in _COPY_CMDS:
+        return [(w, "overwrite") for w in _mv_cp_dest(args)]
+    if prog == "find":
+        starts, expr = _find_starts(args)
+        return [(w, "find delete") for w in starts] if _find_deletes(expr, depth) else []
+    return []
+
+
+def _truncate_redirect_targets(simple: "shellparse.Simple") -> List[str]:
+    toks = simple.tokens
+    out = []
+    for i, t in enumerate(toks):
+        if t.redirect and _TRUNC_RE.match(t.raw) and i + 1 < len(toks) and not toks[i + 1].redirect:
+            out.append(toks[i + 1].value)
+    return out
+
+
+def _destructive_targets(text: str, cwd: Optional[str]) -> List[Tuple[str, str]]:
+    """(resolved absolute target, op label) for each destructive operation the
+    shell text performs: deletes, moves, copies over a file, truncating `>`."""
+    results: List[Tuple[str, str]] = []
+    try:
+        simples = shellparse.split_commands(text)
+    except Exception:
+        return results
+    cwds: List[Optional[str]] = [cwd, cwd]
+    for simple in simples:
+        redirs = _truncate_redirect_targets(simple)
+        for r, words in enumerate(_readings(simple)):
+            argv, _ = _program_argv(words)
+            c = cwds[r]
+            if argv:
+                prog, args = _base(argv[0]), argv[1:]
+                if prog in CD_PROGRAMS:
+                    cwds[r] = _cd_target(args, c)
+                    continue
+                if prog == "popd":
+                    cwds[r] = None
+                    continue
+                for w, label in _op_target_words(prog, argv, args, 0):
+                    for e in _expand_braces(_trim(w)):
+                        p = _scope_resolve(e, c)
+                        if p:
+                            results.append((p, label))
+            if r == 0:
+                for w in redirs:
+                    p = _scope_resolve(w, c)
+                    if p:
+                        results.append((p, "overwrite"))
+    return results
+
+
+def _code_destructive_targets(code: str, cwd: Optional[str]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    if not isinstance(code, str) or not code:
+        return out
+    low = code.lower()
+    for pattern, *guards in _CODE_SIMPLE:
+        if any(g in low for g in guards):
+            for m in pattern.finditer(code):
+                p = _code_arg_path(m.group(1))
+                if p is not None:
+                    r = _scope_resolve(p, cwd)
+                    if r:
+                        out.append((r, "delete (code)"))
+    for pattern, *guards in _CODE_OPTS:
+        if any(g in low for g in guards):
+            for m in pattern.finditer(code):
+                if "recursive" in m.group(2).lower():
+                    p = _code_arg_path(m.group(1))
+                    if p is not None:
+                        r = _scope_resolve(p, cwd)
+                        if r:
+                            out.append((r, "delete (code)"))
+    if "del([" in low.replace(" ", "") or "del.sync([" in low.replace(" ", ""):
+        for m in _CODE_DEL_RE.finditer(code):
+            for item in _STRING_ITEM_RE.findall(m.group(1)):
+                r = _scope_resolve(item, cwd)
+                if r:
+                    out.append((r, "delete (code)"))
+    if "[" in code and ("subprocess" in low or "execv" in low or "child_process" in low):
+        for m in _CODE_SUBPROC_RE.finditer(code):
+            items = _STRING_ITEM_RE.findall(m.group(1))
+            if items:
+                out += _destructive_targets(" ".join(_shq(x) for x in items), cwd)
+    return out
+
+
+def _norm_root(path: str) -> Optional[str]:
+    return _scope_resolve(path, None)
+
+
+def _default_allowed_roots(project_root: Optional[str], cwd: Optional[str]) -> List[str]:
+    roots: List[str] = []
+    for b in (project_root, cwd):
+        if b:
+            r = _norm_root(b)
+            if r:
+                roots.append(r)
+    roots += list(_SCRATCH_DIRS)
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        v = os.environ.get(var)
+        if v:
+            r = _norm_root(v)
+            if r:
+                roots.append(r)
+    for c in _HOME_CACHE:
+        r = _norm_root("~/" + c)
+        if r:
+            roots.append(r)
+    return roots
+
+
+def _under(path: str, roots: Sequence[str]) -> bool:
+    for r in roots:
+        rr = r.rstrip("/")
+        if rr and (path == rr or path.startswith(rr + "/")):
+            return True
+    return False
+
+
+def _display(p: str) -> str:
+    if p == HOME or p.startswith(HOME + "/"):
+        return "~" + p[len(HOME):]
+    m = re.match(r"^/mnt/([a-z])(/.*)?$", p)
+    if m:
+        return m.group(1).upper() + ":" + (m.group(2) or "/")
+    return p
+
+
+def outside_project_hit(command: str, cwd: Optional[str] = None, project_root: Optional[str] = None,
+                        allow_dirs: Sequence[str] = ()) -> str:
+    """A plain description when the command deletes, moves, copies over or
+    truncates a file outside the project folder (and outside the scratch/cache
+    allowlist); "" when not, or when no project folder is known. cwd resolves
+    relative targets; project_root (or cwd) is the boundary."""
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    if not (project_root or cwd):
+        return ""
+    low = command.lower()
+    if not (">" in command or any(w in low for w in _DESTRUCTIVE_WORDS)
+            or any(g in low for g in _LIB_MENTIONS)):
+        return ""
+    rcwd = cwd or project_root
+    roots = _default_allowed_roots(project_root, cwd)
+    for d in allow_dirs:
+        if d:
+            r = _norm_root(d)
+            if r:
+                roots.append(r)
+    texts = [command]
+    try:
+        texts += shellparse.extract_scripts(command)
+    except Exception:
+        pass
+    for text in texts:
+        for p, label in _destructive_targets(text, rcwd) + _code_destructive_targets(text, rcwd):
+            if not _under(p, roots):
+                return f"{label} of {_display(p)} outside the project folder"
+    return ""

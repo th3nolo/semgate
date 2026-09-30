@@ -448,7 +448,7 @@ def judge(
     if script_ev is not None and script_ev.found:
         evidence_record["script_source"] = script_ev.record(sent=False)
         if script_ev.files:
-            sd = rules.script_catastrophic_deny(script_ev.files)
+            sd = rules.script_catastrophic_deny(script_ev.files, envelope.environment.project_root or "")
             if sd.outcome == "deny":
                 return finish(Decision(
                     decision="deny",
@@ -490,7 +490,7 @@ def judge(
                 if all(g.gate_class != h.gate_class for g in line_gates):
                     line_gates.append(rules.GateHit(gate_class=h.gate_class, matched=f"in {line.where}: {h.matched}"[:200]))
         if test_ev.files:
-            sd = rules.script_catastrophic_deny(test_ev.files)
+            sd = rules.script_catastrophic_deny(test_ev.files, envelope.environment.project_root or "")
             if sd.outcome == "deny":
                 return finish(Decision(
                     decision="deny",

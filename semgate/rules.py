@@ -693,6 +693,14 @@ def check_hard_deny(envelope: Envelope) -> RuleResult:
     catastrophic_what = catastrophic.catastrophic_hit(command, cwd) or catastrophic.system_control_hit(command)
     if catastrophic_what:
         return RuleResult(outcome="deny", rule="hard_deny", detail=catastrophic_what)
+    # A destructive command (delete, move, copy-over, truncating redirect) whose
+    # target is outside the project folder, and outside the scratch/cache
+    # allowlist, is a hard deny by default: "clean node_modules" must not delete
+    # the global one. Reads are never scoped. Boundary: project_root, then cwd.
+    outside = catastrophic.outside_project_hit(command, envelope.environment.cwd or None,
+                                               envelope.environment.project_root or None)
+    if outside:
+        return RuleResult(outcome="deny", rule="outside_project", detail=outside)
     written = semgate_state_write(envelope) or semgate_state_code_write(_command(envelope))
     if written:
         return RuleResult(outcome="deny", rule="hard_deny",
@@ -1029,12 +1037,13 @@ def detect_gates(envelope: Envelope, path_dirs: Sequence[str] = (), pins: Any = 
     return hits
 
 
-def script_catastrophic_deny(scripts: List["Any"]) -> RuleResult:
+def script_catastrophic_deny(scripts: List["Any"], project_root: str = "") -> RuleResult:
     """A catastrophic delete inside a local script the command runs
     (scriptsource.ScriptFile) is a hard deny, the same as the inline command.
     Unlike the denylist patterns (an ask, because a file holds names like
     `def shutdown`), the parsed rule needs a real `rm -rf /` or `shutil.rmtree("/")`
-    call, so a file that only mentions one is not a hit."""
+    call, so a file that only mentions one is not a hit. A destructive op in the
+    file whose target is outside the project folder is a hard deny too."""
     from . import scriptsource
     for script in scripts:
         if not getattr(script, "content", ""):
@@ -1046,9 +1055,11 @@ def script_catastrophic_deny(scripts: List["Any"]) -> RuleResult:
             hard_text, _ = scriptsource.gate_texts(script)
         except Exception:
             hard_text = script.content
+        run_cwd = getattr(script, "run_cwd", "") or project_root or None
         try:
             what = (catastrophic.catastrophic_hit(hard_text) or catastrophic.code_hit(hard_text)
-                    or catastrophic.system_control_hit(hard_text))
+                    or catastrophic.system_control_hit(hard_text)
+                    or catastrophic.outside_project_hit(hard_text, run_cwd, project_root or None))
         except Exception:
             what = ""
         if what:
