@@ -66,11 +66,18 @@ Also seen now (added after 0.4.2):
 - a listing piped to a recursive delete (`find / | xargs rm -rf`,
   `find / -print0 | xargs -0 rm -rf`, from / or a system or home folder), with
   the same home-folder narrowing exception as find -delete;
-- a recursive delete through a library call, in inline code or a script file
-  (`shutil.rmtree("/")`, `os.removedirs("/")`, `subprocess.run(["rm","-rf","/"])`,
-  Node `fs.rmSync("/", {recursive:true})`, Ruby `FileUtils.rm_rf("/")`), with the
-  target given as "/", "~", `Path.home()`, `os.path.expanduser("~")` or
-  `process.env.HOME`;
+- a recursive delete through a library call, in inline code or a script file:
+  Python (`shutil.rmtree("/")`, `os.removedirs("/")`, `subprocess.run(["rm","-rf","/"])`),
+  Node (`fs.rmSync("/", {recursive:true})`, `rimraf("/")`, `del(["/"])`),
+  Ruby (`FileUtils.rm_rf("/")`), Deno (`Deno.removeSync("/", {recursive:true})`),
+  Perl (`rmtree("/")`, `remove_tree("/")`) and Go (`os.RemoveAll("/")`), with the
+  target given as "/", "~", `Path.home()`, `os.path.expanduser("~")`,
+  `process.env.HOME` or wrapped in `Path::new("/")` / `new File("/")`.
+  Reached inline (`python -c`, `node -e`, `deno eval`, `perl -e`) and in the
+  files semgate reads (.py .js .rb .sh .pl, and .go through `go run x.go`).
+  Rust, Java and .NET are NOT covered: they have no inline eval and no
+  single-command run-from-source semgate parses, so a literal-shape rule for
+  them would be dead code; those fall to the judge / human gate instead;
 - ANSI-C escapes in the program word (`$'\\x72m' -rf /`);
 - PowerShell `Remove-Item -Recurse` of / or the home folder;
 - `rm -rf *` when the folder the command runs in (cwd) is / or the home folder.
@@ -739,11 +746,25 @@ def _pipe_deletes(words: Sequence[str], depth: int) -> bool:
 # Recursive delete through a library, in inline code (python -c, node -e) or a
 # script file: shutil.rmtree("/"), fs.rmSync("/", {recursive:true}),
 # FileUtils.rm_rf("/"). The parsed shell rule never sees these.
-_CODE_RMTREE_RE = re.compile(r"\b(?:shutil\.rmtree|os\.removedirs)\s*\(\s*([^,\n]+)")
-_CODE_FS_RE = re.compile(
-    r"(?:\bfs|require\(\s*['\"]fs['\"]\s*\))(?:\.promises)?\.(rmSync|rm|rmdirSync|rmdir)\s*\("
-    r"\s*([^,\n]+?)\s*,\s*(\{[^}\n]*\})")
-_CODE_FILEUTILS_RE = re.compile(r"\bFileUtils\.rm_r[f]?\s*\(\s*([^,\n]+)")
+_STRING_ITEM_RE = re.compile(r"""['"]([^'"]*)['"]""")
+# Recursive-delete calls that are always recursive and take the target as their
+# first argument: (compiled regex with the target in group 1, a cheap substring
+# that must be in the code before the regex runs). One per language / library.
+_CODE_SIMPLE = (
+    (re.compile(r"\b(?:shutil\.rmtree|os\.removedirs)\s*\(\s*([^,\n]+)"), "rmtree", "removedirs"),  # Python
+    (re.compile(r"\bFileUtils\.rm_r[f]?\s*\(\s*([^,\n]+)"), "fileutils.rm_r"),                       # Ruby
+    (re.compile(r"\bos\.RemoveAll\s*\(\s*([^,)\n]+)"), "removeall"),                                 # Go (go run x.go)
+    (re.compile(r"\b(?:File::Path::)?(?:rmtree|remove_tree)\s*\(\s*([^,)\n;]+)"), "rmtree", "remove_tree"),  # Perl
+    (re.compile(r"\b(?:rimraf|require\(\s*['\"]rimraf['\"]\s*\))(?:\.sync)?\s*\(\s*([^,)\n]+)"), "rimraf"),   # npm rimraf
+)
+# Recursive only with an options object that says so (Node fs, Deno). group 1 is
+# the target, group 2 the options object.
+_CODE_OPTS = (
+    (re.compile(r"(?:\bfs|require\(\s*['\"]fs['\"]\s*\))(?:\.promises)?\.(?:rmSync|rm|rmdirSync|rmdir)\s*\("
+                r"\s*([^,\n]+?)\s*,\s*(\{[^}\n]*\})"), "rmsync", "rmdirsync", ".rm(", "fs.promises"),  # Node fs
+    (re.compile(r"\bDeno\.(?:remove|removeSync)\s*\(\s*([^,\n]+?)\s*,\s*(\{[^}\n]*\})"), "deno.remove"),  # Deno
+)
+_CODE_DEL_RE = re.compile(r"\bdel(?:\.sync)?\s*\(\s*\[([^\]]*)\]")                                    # npm del (globs)
 _CODE_SUBPROC_RE = re.compile(
     r"\b(?:subprocess\.(?:run|call|Popen|check_call|check_output)|os\.execv?p?e?|child_process\.\w+)\s*\(\s*\[([^\]]*)\]")
 # The target argument is the home folder, spelled as a call rather than a string.
@@ -754,28 +775,38 @@ _CODE_HOME_RE = re.compile(
     r"|os\.environ(?:\.get)?\s*[\[(]\s*['\"](?:HOME|USERPROFILE)['\"]"
     r"|os\.homedir\s*\(\s*\)|require\(\s*['\"]os['\"]\s*\)\.homedir\s*\(\s*\)"
     r"|process\.env\.(?:HOME|USERPROFILE))")
-_STRING_ITEM_RE = re.compile(r"""['"]([^'"]*)['"]""")
+_CODE_LITERAL_RE = re.compile(r"""(['"`])(.*?)\1""")
 
 
 def _code_arg_catastrophic(arg: str) -> bool:
-    """The first argument of a delete call names a catastrophic target: a
-    string literal like "/" or "~", or a home-folder expression."""
+    """The first argument of a delete call names a catastrophic target: a string
+    literal like "/" or "~" (single, double or backtick quotes), a home-folder
+    expression, or a literal wrapped in a path constructor (Path::new("/"),
+    new File("/"), PathBuf::from("/"))."""
     arg = arg.strip()
     if not arg:
         return False
-    if arg[0] in "'\"":
+    if arg[0] in "'\"`":
         end = arg.find(arg[0], 1)
         return end > 0 and is_catastrophic(arg[1:end])
-    return bool(_CODE_HOME_RE.match(arg))
+    if _CODE_HOME_RE.match(arg):
+        return True
+    m = _CODE_LITERAL_RE.search(arg)
+    return bool(m) and is_catastrophic(m.group(2))
 
 
 def _shq(word: str) -> str:
     return "'" + word.replace("'", "'\\''") + "'" if re.search(r"\s", word) else word
 
 
+def _report(target: str, code: str) -> str:
+    return f"recursive delete of {target.strip()[:60]} (catastrophic, irreversible): {code.strip()[:140]}"
+
+
 def _code_hit(code: str) -> str:
     """A catastrophic delete expressed as a library call or an argument list in
-    code (module doc: library calls). "" when none."""
+    code (module doc: library calls), in Python, Node, Ruby, Go, Rust, Perl,
+    Java or .NET. "" when none."""
     if not isinstance(code, str) or not code:
         return ""
     low = code.lower()
@@ -788,19 +819,21 @@ def _code_hit(code: str) -> str:
                 hit = _text_hit(" ".join(_shq(x) for x in items), MAX_DEPTH - 1, None)
                 if hit:
                     return hit
-    if "rmtree" in low or "removedirs" in low:
-        for m in _CODE_RMTREE_RE.finditer(code):
-            if _code_arg_catastrophic(m.group(1)):
-                return f"recursive delete of {m.group(1).strip()[:60]} (catastrophic, irreversible): {code.strip()[:140]}"
-    if "recursive" in low and ("rmsync" in low or "rmdirsync" in low or ".rm(" in low.replace(" ", "")):
-        for m in _CODE_FS_RE.finditer(code):
-            arg, opts = m.group(2), m.group(3)
-            if "recursive" in opts.lower() and _code_arg_catastrophic(arg):
-                return f"recursive delete of {arg.strip()[:60]} (catastrophic, irreversible): {code.strip()[:140]}"
-    if "fileutils.rm_r" in low:
-        for m in _CODE_FILEUTILS_RE.finditer(code):
-            if _code_arg_catastrophic(m.group(1)):
-                return f"recursive delete of {m.group(1).strip()[:60]} (catastrophic, irreversible): {code.strip()[:140]}"
+    for pattern, *guards in _CODE_SIMPLE:
+        if any(g in low for g in guards):
+            for m in pattern.finditer(code):
+                if _code_arg_catastrophic(m.group(1)):
+                    return _report(m.group(1), code)
+    for pattern, *guards in _CODE_OPTS:
+        if any(g in low for g in guards):
+            for m in pattern.finditer(code):
+                if "recursive" in m.group(2).lower() and _code_arg_catastrophic(m.group(1)):
+                    return _report(m.group(1), code)
+    if "del(" in low.replace(" ", "") or "del.sync(" in low.replace(" ", ""):
+        for m in _CODE_DEL_RE.finditer(code):                      # npm del(['/']) deletes matched paths
+            for item in _STRING_ITEM_RE.findall(m.group(1)):
+                if is_catastrophic(item):
+                    return _report(item, code)
     return ""
 
 
@@ -924,17 +957,23 @@ _RF_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*r[A-Za-z]*f[A-Za-z]*(?:\s|$)"
                          r"|(?:^|\s)-[A-Za-z]*f[A-Za-z]*r[A-Za-z]*(?:\s|$)", re.IGNORECASE)
 # A variable program (`$R`, `${RM}`, `$env:...`) next to a recursive-ish flag.
 _VAR_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*[rR][A-Za-z]*|--recursive|--force|--no-preserve-root", re.IGNORECASE)
+# Library-delete names whose text does not contain an rm/find/chmod word, so the
+# _MENTION check above misses them (deno eval, node -e rimraf, a Go/Rust file).
+_LIB_MENTIONS = ("remove-item", "removedirs", "rmtree", "removeall", "remove_tree",
+                 "rimraf", "removesync", "deno.remove")
 
 
 def _mentions(command: str) -> bool:
     """A fast check to skip parsing: does the text plausibly hold a catastrophic
-    program? Quotes and escape characters are removed first (`r''m`, `r\\m`,
-    `ch^mod`). Broad on purpose: a false yes only costs one parse that finds
-    nothing; a false no would miss a real hit."""
+    program or a library-delete call? Quotes and escape characters are removed
+    first (`r''m`, `r\\m`, `ch^mod`). Broad on purpose: a false yes only costs
+    one parse that finds nothing; a false no would miss a real hit."""
     flat = re.sub(r"[\"'\\^`$]", "", command).lower()
     if any(name in flat for name in _MENTION):
         return True
-    if "remove-item" in flat or "removedirs" in flat or "rmtree" in flat:
+    if any(name in flat for name in _LIB_MENTIONS):
+        return True
+    if "del([" in flat.replace(" ", "") or "del.sync([" in flat.replace(" ", ""):   # npm del(['/'])
         return True
     if "$'" in command:                                # ANSI-C quoting can hide the program name
         return True

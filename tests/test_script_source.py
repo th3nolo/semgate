@@ -141,6 +141,33 @@ def test_a_script_that_only_mentions_a_catastrophic_delete_is_not_denied(proj, b
     assert not (d.decision == "deny" and d.stage == "hard_rules"), body
 
 
+# A catastrophic delete in a Go, Perl or JS/Node script file the command runs is
+# a hard deny, the same as the inline library call. semgate reads .go via
+# `go run x.go`, .pl via `perl x.pl`, .js via `node x.js`.
+@pytest.mark.parametrize("name,cmd,body", [
+    ("wipe.go", "go run wipe.go", 'package main\nimport "os"\nfunc main(){ os.RemoveAll("/") }\n'),
+    ("wipe.pl", "perl wipe.pl", "use File::Path;\nrmtree('/');\n"),
+    ("wipe.js", "node wipe.js", "const del=require('del'); del(['/']);\n"),
+    ("wipe2.js", "node wipe2.js", "require('rimraf').sync('/')\n"),
+])
+def test_catastrophic_delete_in_other_language_files_is_a_hard_deny(proj, name, cmd, body):
+    (proj / name).write_text(body)
+    d, provider = run(cmd, proj)
+    assert (d.decision, d.stage, d.reason_code) == ("deny", "hard_rules", "hard_deny"), (cmd, d.reasons)
+    assert provider.states == []
+
+
+@pytest.mark.parametrize("name,cmd,body", [
+    ("clean.go", "go run clean.go", 'package main\nimport "os"\nfunc main(){ os.RemoveAll("./build") }\n'),
+    ("build.go", "go build wipe.go", 'package main\nimport "os"\nfunc main(){ os.RemoveAll("/") }\n'),  # build != run
+    ("clean.pl", "perl clean.pl", "use File::Path;\nrmtree('build');\n"),
+])
+def test_other_language_files_that_are_safe_or_not_run_are_not_denied(proj, name, cmd, body):
+    (proj / name).write_text(body)
+    d, _ = run(cmd, proj)
+    assert not (d.decision == "deny" and d.stage == "hard_rules"), (cmd, d.reasons)
+
+
 def test_shell_script_data_is_not_a_gate(proj):
     (proj / "notes.sh").write_text("echo 'remember: rm -rf is dangerous'\ngrep -rn 'sudo' docs/\n")
     d, provider = run("bash notes.sh", proj)

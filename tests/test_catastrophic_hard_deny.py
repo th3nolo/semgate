@@ -91,6 +91,11 @@ DENY = [
     "node -e \"require('fs').rmSync('/', {recursive: true})\"",
     "node -e \"const fs=require('fs'); fs.rmSync('/', {recursive:true, force:true})\"",
     "ruby -e \"require 'fileutils'; FileUtils.rm_rf('/')\"",
+    # more languages/libraries, inline (reached via node -e, deno eval, perl -e)
+    "node -e \"require('rimraf').sync('/')\"", "node -e \"const del=require('del'); del(['/'])\"",
+    "deno eval \"Deno.removeSync('/', {recursive:true})\"",
+    "deno eval \"Deno.remove('/', {recursive:true})\"",
+    "perl -e \"use File::Path; rmtree('/')\"", "perl -e \"use File::Path; remove_tree('/')\"",
     # ANSI-C escapes in the program word
     "$'\\x72m' -rf /", "$'\\162m' -rf /", "$'\\x72\\x6d' -rf /",
     # PowerShell Remove-Item of the home folder
@@ -120,6 +125,10 @@ NOT_HARD_DENIED = [
     "find ~ -iname node_modules | xargs rm -rf", "find /var/log | xargs gzip",
     # PowerShell Remove-Item of an in-project folder (needs a real catastrophic target)
     r"Remove-Item -Recurse -Force .\node_modules", r"Remove-Item C:\Users\me\Desktop\x.log",
+    # library-delete of an in-project path in the added languages: not catastrophic
+    "node -e \"require('rimraf').sync('node_modules')\"", "deno eval \"Deno.removeSync('./build', {recursive:true})\"",
+    "perl -e \"use File::Path; rmtree('build')\"", "node -e \"const del=require('del'); del(['dist/**'])\"",
+    "deno eval \"Deno.removeSync('/tmp/x')\"",   # no recursive option -> not our concern
     # the over-broad text regexes are gone: these mention a command but do not run it
     "grep -rn shutdown src/", 'git commit -m "fix reboot handling"', "echo rm -rf /",
     'git log --grep "rm -rf ~"', "rm -rf ~/project/build", "rm -rf /*.bak",
