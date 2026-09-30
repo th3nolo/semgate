@@ -180,7 +180,7 @@ def test_one_version_source():
     data = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert "version" not in data["project"] and "version" in data["project"]["dynamic"]
     assert data["tool"]["setuptools"]["dynamic"]["version"] == {"attr": "semgate.__version__"}
-    assert semgate.__version__ == "0.4.2"
+    assert semgate.__version__ == "0.4.3"
     try:
         installed = importlib.metadata.version("semgate")
     except importlib.metadata.PackageNotFoundError:
