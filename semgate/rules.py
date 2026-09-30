@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
-from . import adminguard, injection, linkplace, shellparse
+from . import adminguard, catastrophic, injection, linkplace, shellparse
 from .envelope import Envelope
 from .trust import TRUST_REQUEST_RE
 
@@ -193,6 +193,9 @@ _CODE_SEMGATE_RE = re.compile(r"\.semgate\b", re.IGNORECASE)
 # Commands that are denied outright regardless of grant or model opinion.
 # MULTILINE: the searched text has one argument per line, so `$` must match at
 # the end of the command's line, not only at the end of the whole text.
+# The three rm patterns see only one spelling; check_hard_deny also runs the
+# parsed rule in catastrophic.py (rm -fr /, rm -r -f /, --no-preserve-root,
+# find / -delete, chmod -R on / or the home folder, ...).
 HARD_DENY_PATTERNS: Tuple[re.Pattern, ...] = tuple(
     re.compile(p, re.IGNORECASE | re.MULTILINE)
     for p in (
@@ -684,6 +687,13 @@ def check_hard_deny(envelope: Envelope) -> RuleResult:
         match = pattern.search(text)
         if match:
             return RuleResult(outcome="deny", rule="hard_deny", detail=f"matches deny pattern: {match.group(0)!r}")
+    # Catastrophic deletes and permission changes in every spelling (rm -fr /,
+    # rm -r -f /, rm -rf / --no-preserve-root, find / -delete, chmod -R 777 /,
+    # through sudo, bash -c, python -c ...). Parsed, not matched as text
+    # (catastrophic.py): the regexes above only see `rm -rf /` at the end of a line.
+    catastrophic_what = catastrophic.catastrophic_hit(_command(envelope))
+    if catastrophic_what:
+        return RuleResult(outcome="deny", rule="hard_deny", detail=catastrophic_what)
     written = semgate_state_write(envelope) or semgate_state_code_write(_command(envelope))
     if written:
         return RuleResult(outcome="deny", rule="hard_deny",

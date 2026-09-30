@@ -176,8 +176,10 @@ NEVER_TRUST_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
 
 
 def hard_rule_hit(command: str) -> str:
-    """The hard-deny pattern text the command (or code it runs) matches, or ""."""
-    from . import rules, shellparse
+    """The hard-deny pattern text the command (or code it runs) matches, or
+    the catastrophic.py rule it hits (rm -fr /, rm -rf / --no-preserve-root,
+    find / -delete ...), or ""."""
+    from . import catastrophic, rules, shellparse
     try:
         scripts = shellparse.extract_scripts(command)
     except Exception:
@@ -187,7 +189,7 @@ def hard_rule_hit(command: str) -> str:
         m = pattern.search(text)
         if m:
             return m.group(0)[:120]
-    return ""
+    return catastrophic.catastrophic_hit(command)[:120]
 
 
 def refuse_reason(command: str) -> str:
