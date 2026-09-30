@@ -448,6 +448,13 @@ def judge(
     if script_ev is not None and script_ev.found:
         evidence_record["script_source"] = script_ev.record(sent=False)
         if script_ev.files:
+            sd = rules.script_catastrophic_deny(script_ev.files)
+            if sd.outcome == "deny":
+                return finish(Decision(
+                    decision="deny",
+                    reasons=[f"{sd.rule}: a script this command runs is catastrophic: {sd.detail}"],
+                    stage="hard_rules", reason_code=sd.rule, **base,
+                ))
             script_gates.extend(rules.script_gate_hits(script_ev.files, envelope.environment.project_root, path_dirs))
             gate_hits = list(gate_hits) + script_gates
         if script_ev.scrub_failed:
@@ -483,6 +490,13 @@ def judge(
                 if all(g.gate_class != h.gate_class for g in line_gates):
                     line_gates.append(rules.GateHit(gate_class=h.gate_class, matched=f"in {line.where}: {h.matched}"[:200]))
         if test_ev.files:
+            sd = rules.script_catastrophic_deny(test_ev.files)
+            if sd.outcome == "deny":
+                return finish(Decision(
+                    decision="deny",
+                    reasons=[f"{sd.rule}: a file this command runs is catastrophic: {sd.detail}"],
+                    stage="hard_rules", reason_code=sd.rule, **base,
+                ))
             line_gates.extend(rules.script_gate_hits(test_ev.files, envelope.environment.project_root, path_dirs))
         # Build-time code (build.rs, the project's proc macros) that uses the
         # network: testrun.build_code_hits (router.test_run_build_facts).

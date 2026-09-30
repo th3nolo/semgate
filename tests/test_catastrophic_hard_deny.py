@@ -76,6 +76,26 @@ DENY = [
     "chmod -R 777 /", "sudo chmod -R 000 /etc", "chown -R me /usr", "chgrp -R staff /home", "chmod --recursive 755 /etc",
     "sudo chown -R me /{usr,home/me}",
     "find / -exec chmod 777 {} +",
+    # a variable program with a literal catastrophic target (added after 0.4.2)
+    "$R -rf /", "${RM} -rf /", "R=rm; $R -rf /", "sudo $R -rf /", "$R -rf ~", "$R --recursive --force /etc",
+    # a listing piped to a recursive delete
+    "find / | xargs rm -rf", "find / -print0 | xargs -0 rm -rf", "find ~ | xargs rm -rf",
+    "find /usr -type f | xargs rm -f", "find / | xargs -0 rm -fr", "find /etc -type f | xargs rm",
+    "find / -mount | xargs shred", "find ~ | xargs chmod -R 777",
+    # a recursive delete through a library call, inline
+    "python -c \"import shutil; shutil.rmtree('/')\"", "python -c \"import os; os.removedirs('/')\"",
+    "python -c \"import subprocess; subprocess.run(['rm','-rf','/'])\"",
+    "python -c \"import subprocess; subprocess.call(['rm','-fr','/'])\"",
+    "python -c \"import shutil,pathlib; shutil.rmtree(pathlib.Path.home())\"",
+    "python -c \"import shutil,os; shutil.rmtree(os.path.expanduser('~'))\"",
+    "node -e \"require('fs').rmSync('/', {recursive: true})\"",
+    "node -e \"const fs=require('fs'); fs.rmSync('/', {recursive:true, force:true})\"",
+    "ruby -e \"require 'fileutils'; FileUtils.rm_rf('/')\"",
+    # ANSI-C escapes in the program word
+    "$'\\x72m' -rf /", "$'\\162m' -rf /", "$'\\x72\\x6d' -rf /",
+    # PowerShell Remove-Item of the home folder
+    "Remove-Item -Recurse $HOME", "Remove-Item -Recurse -Force -Path ~", "Remove-Item -Recurse ${HOME}",
+    "ri -Recurse -Force $env:USERPROFILE",
 ]
 
 # Not a hard deny from the new rule. Some are still a human gate (ask).
@@ -90,6 +110,19 @@ NOT_HARD_DENIED = [
     "find /home/me -iname '*.pyc' -delete", "sudo chown -R $USER ~", "chgrp -R staff ~", "chmod -R go-w ~",
     'echo "rm -rf / --no-preserve-root"', 'grep -rn "rm -rf / --no-preserve-root" docs',
     'git commit -m "block rm -rf / --no-preserve-root"', "printf '%s\\n' 'sudo rm -fr /'",
+    # the TARGET in a variable stays a human gate: a build script writes this with
+    # $DIR set, so a hard deny would block real work (the ask still catches it)
+    'rm -rf "$DIR/"', 'rm -rf "$DIR"/*', "rm -rf $DIR/*", "rm -rf ${BUILD}/",
+    # a variable program with a non-catastrophic target: not rm-like enough to deny
+    "$R -rf /home/me/project", "$R -rf ./build",
+    # a listing piped to a delete, but the start folder is narrowed or safe
+    "find ~ -name '*.bak' | xargs rm", "find /tmp/x | xargs rm -rf", "find . | xargs rm",
+    "find ~ -iname node_modules | xargs rm -rf", "find /var/log | xargs gzip",
+    # PowerShell Remove-Item of an in-project folder (needs a real catastrophic target)
+    r"Remove-Item -Recurse -Force .\node_modules", r"Remove-Item C:\Users\me\Desktop\x.log",
+    # the over-broad text regexes are gone: these mention a command but do not run it
+    "grep -rn shutdown src/", 'git commit -m "fix reboot handling"', "echo rm -rf /",
+    'git log --grep "rm -rf ~"', "rm -rf ~/project/build", "rm -rf /*.bak",
 ]
 
 
@@ -123,6 +156,66 @@ def test_the_reason_names_the_rule_and_the_command():
             == "find ~ -delete (catastrophic, irreversible): find ~ -delete")
     assert (catastrophic.catastrophic_hit("chmod -R 777 /")
             == "recursive chmod of / (catastrophic, irreversible): chmod -R 777 /")
+
+
+# ------------------------------------------------------------------ rm -rf * from / or home
+
+@pytest.mark.parametrize("cwd", ["/", "/home/me", "/Users/me", "/mnt/c/Users/Manuel", r"C:\Users\Manuel"])
+def test_rm_star_is_a_hard_deny_when_the_cwd_is_root_or_home(cwd):
+    spy = SpyJudge()
+    d = judge(_env("rm -rf *", root=cwd), Policy.load(str(DEV)), provider=spy)
+    assert (d.decision, d.stage, d.reason_code) == ("deny", "hard_rules", "hard_deny"), (cwd, d.reasons)
+    assert spy.calls == 0
+
+
+@pytest.mark.parametrize("cwd", ["/p", "/home/me/project", "/tmp/work", r"C:\Users\Manuel\proj"])
+def test_rm_star_is_not_a_hard_deny_from_an_ordinary_folder(cwd):
+    d = judge(_env("rm -rf *", root=cwd), Policy.load(str(DEV)), provider=SpyJudge())
+    assert not (d.decision == "deny" and d.stage == "hard_rules"), (cwd, d.reasons)
+
+
+# ------------------------------------------------------------------ shutdown / reboot as a program
+
+@pytest.mark.parametrize("command", ["shutdown", "sudo shutdown -h now", "shutdown -r now", "reboot", "sudo reboot",
+                                     "bash -c 'reboot'", "Restart-Computer", "Stop-Computer -Force", "Stop-Computer"])
+def test_shutdown_and_reboot_are_a_hard_deny_as_the_program(command):
+    assert catastrophic.system_control_hit(command), command
+    spy = SpyJudge()
+    d = Gate(purpose=PURPOSE, provider=spy).check(command)
+    assert (d.decision, d.stage) == ("deny", "hard_rules") and spy.calls == 0
+
+
+@pytest.mark.parametrize("command", ["grep -rn shutdown src/", 'git commit -m "fix reboot handling"',
+                                     "echo shutdown now", 'git log --grep "reboot"', "cat shutdown.md",
+                                     "./scripts/reboot-notes.sh --dry-run"])
+def test_shutdown_and_reboot_as_text_are_not_a_hard_deny(command):
+    assert catastrophic.system_control_hit(command) == "", command
+    d = Gate(purpose=PURPOSE, provider=SpyJudge()).check(command)
+    assert not (d.decision == "deny" and d.stage == "hard_rules"), d.reasons
+
+
+# ------------------------------------------------------------------ the old over-broad text regexes are gone
+
+def test_removing_the_rm_text_regexes_does_not_loosen_the_parsed_rule():
+    # still denied, now only through the parsed rule
+    for cmd in ["rm -rf /", "rm -rf /*", "rm -rf ~", "sudo rm -Rf /"]:
+        assert Gate(purpose=PURPOSE, provider=SpyJudge()).check(cmd).stage == "hard_rules", cmd
+    # no longer a hard deny: a command that only names rm -rf, or an in-home delete
+    for cmd in ["echo rm -rf /", 'git log --grep "rm -rf ~"', "rm -rf ~/project/build", "rm -rf /*.bak",
+                'grep -rn "rm -rf /" docs']:
+        assert Gate(purpose=PURPOSE, provider=SpyJudge()).check(cmd).stage != "hard_rules", cmd
+
+
+# ------------------------------------------------------------------ the target in a variable stays an ask
+
+@pytest.mark.parametrize("command", ['rm -rf "$DIR/"', 'rm -rf "$DIR"/*', "rm -rf $DIR/*"])
+def test_a_catastrophic_target_in_a_variable_is_still_the_human_gate(command):
+    # A build script writes `rm -rf "$BUILD/"` with $BUILD set; a hard deny
+    # would block real work. The human gate still asks (destructive_irreversible).
+    assert catastrophic.catastrophic_hit(command) == ""
+    d = judge(_env(command), Policy.load(str(DEV)), provider=SpyJudge())
+    classes = [h["gate_class"] if isinstance(h, dict) else h.gate_class for h in d.gate_hits]
+    assert d.stage == "human_gate" and "destructive_irreversible" in classes
 
 
 def test_a_user_message_that_approves_it_changes_nothing():

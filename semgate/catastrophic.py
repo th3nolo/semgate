@@ -60,12 +60,24 @@ Text that only mentions a command is not a hit: `echo "rm -rf /"`,
 `grep -rn "rm -rf /" docs` and `git commit -m "rm -rf /"` have echo, grep
 and git as their program.
 
-Not seen here: the program or a target in a variable (`R=rm; $R -rf /`,
-`rm -rf "$DIR/"` with DIR empty), a target list from a pipe
-(`find / | xargs rm -rf`), deletes through a library call
-(`shutil.rmtree("/")`, `subprocess.run(["rm", "-rf", "/"])`), ANSI-C escapes
-(`$'\\x72m'`), and PowerShell Remove-Item of the home folder. The human gates
-still ask for those.
+Also seen now (added after 0.4.2):
+- a variable program with a literal catastrophic target (`$R -rf /`,
+  `${RM} -rf /`); the target still must be literal;
+- a listing piped to a recursive delete (`find / | xargs rm -rf`,
+  `find / -print0 | xargs -0 rm -rf`, from / or a system or home folder), with
+  the same home-folder narrowing exception as find -delete;
+- a recursive delete through a library call, in inline code or a script file
+  (`shutil.rmtree("/")`, `os.removedirs("/")`, `subprocess.run(["rm","-rf","/"])`,
+  Node `fs.rmSync("/", {recursive:true})`, Ruby `FileUtils.rm_rf("/")`), with the
+  target given as "/", "~", `Path.home()`, `os.path.expanduser("~")` or
+  `process.env.HOME`;
+- ANSI-C escapes in the program word (`$'\\x72m' -rf /`);
+- PowerShell `Remove-Item -Recurse` of / or the home folder;
+- `rm -rf *` when the folder the command runs in (cwd) is / or the home folder.
+
+Still only a human gate (ask): the target itself in a variable (`rm -rf "$DIR/"`,
+`rm -rf "$DIR"/*`) - a legitimate build script writes this with $DIR set, so a
+hard deny would block real work; the ask still catches the empty-variable wipe.
 """
 from __future__ import annotations
 
@@ -152,14 +164,37 @@ def _base(word: str) -> str:
     return base[:-4] if base.endswith(".exe") else base
 
 
+_ANSI_C_RE = re.compile(r"\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|.)")
+_ANSI_C_SIMPLE = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b",
+                  "f": "\f", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _ansi_c_decode(s: str) -> str:
+    r"""The value of a bash $'...' word: \x72 -> r, \162 -> r, r -> r,
+    \n \t \\ ... A crafted spelling like $'\x72m' -rf / is then read as rm."""
+    def sub(m: "re.Match") -> str:
+        g = m.group(1)
+        try:
+            if g[0] in "xuU":
+                return chr(int(g[1:], 16))
+            if g[0] in "01234567":
+                return chr(int(g, 8) & 0xFF)
+        except (ValueError, OverflowError):
+            return g
+        return _ANSI_C_SIMPLE.get(g, g)
+    return _ANSI_C_RE.sub(sub, s)
+
+
 def _unquote(raw: str) -> str:
-    """A word as written, without its outer quotes ($'...' too). A Windows
-    path keeps its backslashes: cmd and PowerShell do not treat them as
-    escapes."""
+    """A word as written, without its outer quotes ($'...' too). A $'...' word
+    has its ANSI-C escapes decoded, the way bash reads it. A Windows path keeps
+    its backslashes: cmd and PowerShell do not treat them as escapes."""
+    ansi = len(raw) > 2 and raw[0] == "$" and raw[1] == "'"
     if len(raw) > 2 and raw[0] == "$" and raw[1] in "'\"":
         raw = raw[1:]
     if len(raw) > 1 and raw[0] == raw[-1] and raw[0] in "\"'":
-        return raw[1:-1]
+        inner = raw[1:-1]
+        return _ansi_c_decode(inner) if ansi else inner
     return raw
 
 
@@ -326,7 +361,12 @@ def _resolve(word: str, cwd: Optional[str]) -> Optional[str]:
     if not w.startswith("/"):
         if cwd is None:
             return None
-        w = cwd + "/" + w
+        # The cwd may be a Windows drive path (C:\Users\<name>, C:/Users/<name>):
+        # resolve it the same way, so `rm -rf *` run from the home folder is
+        # seen. A bare `/c/...` cwd is left as written: `/p` (a project root)
+        # is a directory, not the C: drive, and a false hard deny is worse.
+        base = _resolve(cwd, None) if (re.match(r"^[A-Za-z]:", cwd) or "\\" in cwd) else cwd
+        w = (base or cwd) + "/" + w
     parts: List[str] = []
     for comp in w.split("/"):
         if comp in ("", "."):
@@ -589,6 +629,220 @@ def _cd_target(args: Sequence[str], cwd: Optional[str]) -> Optional[str]:
     return _resolve(args[k], cwd)
 
 
+# ---------------------------------------------------------------- variable program
+
+# A word that is only a variable reference: `$R`, `${RM}`. The program it names
+# is not known, but `$R -rf /` still has a recursive flag and a literal
+# catastrophic target, which no ordinary program takes.
+_VAR_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$|^\$[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_var(word: str) -> bool:
+    return bool(_VAR_RE.match(word.strip()))
+
+
+# ---------------------------------------------------------------- PowerShell delete
+
+# Remove-Item and its aliases. `Remove-Item -Recurse $HOME` and
+# `Remove-Item -Recurse -Force -Path ~` wipe the home folder; the Unix rm rule
+# and the Windows-drive regexes do not see them.
+POWERSHELL_DELETE = frozenset({"remove-item", "ri", "rmdir", "rd"})
+_PS_RECURSE = frozenset({"-recurse", "-r"})
+_PS_PATH_OPTS = frozenset({"-path", "-literalpath", "-lp"})
+# Options that take a value we should not read as a target.
+_PS_VALUE_OPTS = frozenset({"-include", "-exclude", "-filter", "-stream"})
+
+
+def _powershell_rm_hit(args: Sequence[str], cwd: Optional[str]) -> str:
+    recursive = False
+    targets: List[str] = []
+    skip = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        low = a.lower()
+        if low in _PS_RECURSE:
+            recursive = True
+            continue
+        if low in _PS_PATH_OPTS:
+            continue                                   # the next word is the target
+        if low in _PS_VALUE_OPTS:
+            skip = True
+            continue
+        if a.startswith("-"):
+            continue                                   # -Force, -Confirm:$false, ...
+        targets.append(a)
+    if not recursive:
+        return ""
+    for t in targets:
+        if is_catastrophic(t, cwd):
+            return f"recursive Remove-Item of {_trim(t)}"
+    return ""
+
+
+# ---------------------------------------------------------------- find | xargs rm
+
+def _conn_op(text: str, simple: "shellparse.Simple") -> str:
+    """The operator that joins this simple command to the next one (`|`, `&&`,
+    `;` ...). The lexer sets `end` to the position just after that operator."""
+    end = simple.end
+    two = text[end - 2:end]
+    if two in ("&&", "||", "|&", ";;"):
+        return two
+    one = text[end - 1:end]
+    return one if one in ("|", ";", "&", "\n") else ""
+
+
+def _find_starts(args: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """(start folders, the expression after them) for a find command's args,
+    the same way _find_hit reads them."""
+    i, starts = 0, []
+    while i < len(args):
+        a = args[i]
+        if a in ("-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x") or (a.startswith("-O") and a[2:].isdigit()):
+            i += 1
+        elif a == "-D" and i + 1 < len(args):
+            i += 2
+        elif a == "-f" and i + 1 < len(args):
+            starts.append(args[i + 1])
+            i += 2
+        else:
+            break
+    while i < len(args) and not (args[i].startswith("-") and len(args[i]) > 1) \
+            and args[i] not in ("(", "!", ",", ")", "\\(", "\\!"):
+        starts.append(args[i])
+        i += 1
+    return (starts or ["."]), list(args[i:])
+
+
+def _find_start_catastrophic(find_args: Sequence[str], cwd: Optional[str]) -> str:
+    """The catastrophic start folder of a `find` whose output feeds a deleting
+    xargs, or "". The home-folder narrowing exception (find ~ -name X) applies:
+    a listing narrowed by name or path is a targeted cleanup."""
+    starts, expr = _find_starts(find_args)
+    home_ok = _find_narrowed(expr)
+    for s in starts:
+        if is_catastrophic(s, cwd, home_ok=home_ok):
+            return _trim(s)
+    return ""
+
+
+def _pipe_deletes(words: Sequence[str], depth: int) -> bool:
+    """The command on the receiving end of a pipe runs rm, unlink, shred or a
+    recursive-capable permission change (xargs rm -rf, xargs -0 rm, | rm)."""
+    return any(p in DELETE_PROGRAMS or p in PERM_PROGRAMS for p in _programs_of(words, depth))
+
+
+# ---------------------------------------------------------------- library calls in code
+
+# Recursive delete through a library, in inline code (python -c, node -e) or a
+# script file: shutil.rmtree("/"), fs.rmSync("/", {recursive:true}),
+# FileUtils.rm_rf("/"). The parsed shell rule never sees these.
+_CODE_RMTREE_RE = re.compile(r"\b(?:shutil\.rmtree|os\.removedirs)\s*\(\s*([^,\n]+)")
+_CODE_FS_RE = re.compile(
+    r"(?:\bfs|require\(\s*['\"]fs['\"]\s*\))(?:\.promises)?\.(rmSync|rm|rmdirSync|rmdir)\s*\("
+    r"\s*([^,\n]+?)\s*,\s*(\{[^}\n]*\})")
+_CODE_FILEUTILS_RE = re.compile(r"\bFileUtils\.rm_r[f]?\s*\(\s*([^,\n]+)")
+_CODE_SUBPROC_RE = re.compile(
+    r"\b(?:subprocess\.(?:run|call|Popen|check_call|check_output)|os\.execv?p?e?|child_process\.\w+)\s*\(\s*\[([^\]]*)\]")
+# The target argument is the home folder, spelled as a call rather than a string.
+_CODE_HOME_RE = re.compile(
+    r"^\s*(?:(?:pathlib\.)?Path\.home\s*\(\s*\)"
+    r"|os\.path\.expanduser\s*\(\s*['\"]~['\"]\s*\)"
+    r"|os\.getenv\s*\(\s*['\"](?:HOME|USERPROFILE)['\"]"
+    r"|os\.environ(?:\.get)?\s*[\[(]\s*['\"](?:HOME|USERPROFILE)['\"]"
+    r"|os\.homedir\s*\(\s*\)|require\(\s*['\"]os['\"]\s*\)\.homedir\s*\(\s*\)"
+    r"|process\.env\.(?:HOME|USERPROFILE))")
+_STRING_ITEM_RE = re.compile(r"""['"]([^'"]*)['"]""")
+
+
+def _code_arg_catastrophic(arg: str) -> bool:
+    """The first argument of a delete call names a catastrophic target: a
+    string literal like "/" or "~", or a home-folder expression."""
+    arg = arg.strip()
+    if not arg:
+        return False
+    if arg[0] in "'\"":
+        end = arg.find(arg[0], 1)
+        return end > 0 and is_catastrophic(arg[1:end])
+    return bool(_CODE_HOME_RE.match(arg))
+
+
+def _shq(word: str) -> str:
+    return "'" + word.replace("'", "'\\''") + "'" if re.search(r"\s", word) else word
+
+
+def _code_hit(code: str) -> str:
+    """A catastrophic delete expressed as a library call or an argument list in
+    code (module doc: library calls). "" when none."""
+    if not isinstance(code, str) or not code:
+        return ""
+    low = code.lower()
+    # subprocess/child_process argument lists: rebuild the argv and read it as a
+    # shell command (subprocess.run(["rm", "-rf", "/"])).
+    if "[" in code and ("subprocess" in low or "execv" in low or "child_process" in low):
+        for m in _CODE_SUBPROC_RE.finditer(code):
+            items = _STRING_ITEM_RE.findall(m.group(1))
+            if items:
+                hit = _text_hit(" ".join(_shq(x) for x in items), MAX_DEPTH - 1, None)
+                if hit:
+                    return hit
+    if "rmtree" in low or "removedirs" in low:
+        for m in _CODE_RMTREE_RE.finditer(code):
+            if _code_arg_catastrophic(m.group(1)):
+                return f"recursive delete of {m.group(1).strip()[:60]} (catastrophic, irreversible): {code.strip()[:140]}"
+    if "recursive" in low and ("rmsync" in low or "rmdirsync" in low or ".rm(" in low.replace(" ", "")):
+        for m in _CODE_FS_RE.finditer(code):
+            arg, opts = m.group(2), m.group(3)
+            if "recursive" in opts.lower() and _code_arg_catastrophic(arg):
+                return f"recursive delete of {arg.strip()[:60]} (catastrophic, irreversible): {code.strip()[:140]}"
+    if "fileutils.rm_r" in low:
+        for m in _CODE_FILEUTILS_RE.finditer(code):
+            if _code_arg_catastrophic(m.group(1)):
+                return f"recursive delete of {m.group(1).strip()[:60]} (catastrophic, irreversible): {code.strip()[:140]}"
+    return ""
+
+
+# ---------------------------------------------------------------- system control
+
+# shutdown / reboot as the program (not as text a command prints or searches
+# for). The old HARD_DENY_PATTERNS regexes matched `grep -rn shutdown src/` and
+# `git commit -m "fix reboot handling"`; this reads the parsed program instead.
+_SYSTEM_CONTROL = frozenset({"shutdown", "reboot", "restart-computer", "stop-computer"})
+
+
+def system_control_hit(command: str) -> str:
+    """A plain description when the command, or code it runs, runs shutdown,
+    reboot or the PowerShell Stop-Computer / Restart-Computer; "" when not."""
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    low = command.lower()
+    if not any(k in low for k in _SYSTEM_CONTROL):
+        return ""
+    texts = [command]
+    try:
+        texts += shellparse.extract_scripts(command)
+    except Exception:
+        pass
+    for text in texts:
+        try:
+            simples = shellparse.split_commands(text)
+        except Exception:
+            continue
+        for simple in simples:
+            for words in _readings(simple):
+                for p in _programs_of(words, 0):
+                    if p in _SYSTEM_CONTROL:
+                        return f"{p} (system shutdown/reboot): {_simple_text(simple)}"
+    return ""
+
+
+def code_hit(code: str) -> str:
+    """Public: a catastrophic library-call delete in a code file (script_source)."""
+    return _code_hit(code)
+
+
 # ---------------------------------------------------------------- texts
 
 
@@ -597,18 +851,32 @@ def _simple_text(simple: "shellparse.Simple") -> str:
     return text if len(text) <= 200 else text[:197] + "..."
 
 
-def _text_hit(text: str, depth: int) -> str:
+def _text_hit(text: str, depth: int, cwd0: Optional[str] = None) -> str:
     try:
         simples = shellparse.split_commands(text)
     except Exception:
         return ""
-    cwds: List[Optional[str]] = [None, None]          # one per reading
+    # find <catastrophic> | xargs rm -rf : the delete is on the far side of the
+    # pipe, so no single simple command is a hit on its own.
+    for i in range(len(simples) - 1):
+        if _conn_op(text, simples[i]) not in ("|", "|&"):
+            continue
+        fargv, _ = _program_argv(_readings(simples[i])[0])
+        if not fargv or _base(fargv[0]) != "find":
+            continue
+        if not _pipe_deletes(_readings(simples[i + 1])[0], depth):
+            continue
+        start = _find_start_catastrophic(fargv[1:], cwd0)
+        if start:
+            return (f"find {start} piped to a recursive delete (catastrophic, irreversible): "
+                    f"{_simple_text(simples[i])} | {_simple_text(simples[i + 1])}")
+    cwds: List[Optional[str]] = [cwd0, cwd0]           # one per reading
     for simple in simples:
         for r, words in enumerate(_readings(simple)):
             argv, extra = _program_argv(words)
             if depth < MAX_DEPTH:
                 for code in extra:
-                    hit = _all_hit(code, depth + 1)
+                    hit = _all_hit(code, depth + 1, cwds[r])
                     if hit:
                         return hit
             if not argv:
@@ -626,6 +894,12 @@ def _text_hit(text: str, depth: int) -> str:
                 what = _find_hit(args, cwd, depth)
             elif program in PERM_PROGRAMS:
                 what = _perm_hit(program, args, cwd)
+            elif program in POWERSHELL_DELETE:
+                what = _powershell_rm_hit(args, cwd)
+            elif _is_var(argv[0]):
+                # `$R -rf /`, `${RM} -rf /`: the program is a variable, but a
+                # recursive flag with a literal catastrophic target is rm-like.
+                what = _rm_hit(args, cwd)
             else:
                 what = ""
             if what:
@@ -633,29 +907,47 @@ def _text_hit(text: str, depth: int) -> str:
     return ""
 
 
-def _all_hit(command: str, depth: int) -> str:
+def _all_hit(command: str, depth: int, cwd: Optional[str] = None) -> str:
     texts = [command]
     try:
         texts += shellparse.extract_scripts(command)
     except Exception:
         pass
     for text in texts:
-        hit = _text_hit(text, depth)
+        hit = _text_hit(text, depth, cwd) or _code_hit(text)
         if hit:
             return hit
     return ""
 
 
+_RF_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*r[A-Za-z]*f[A-Za-z]*(?:\s|$)"
+                         r"|(?:^|\s)-[A-Za-z]*f[A-Za-z]*r[A-Za-z]*(?:\s|$)", re.IGNORECASE)
+# A variable program (`$R`, `${RM}`, `$env:...`) next to a recursive-ish flag.
+_VAR_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*[rR][A-Za-z]*|--recursive|--force|--no-preserve-root", re.IGNORECASE)
+
+
 def _mentions(command: str) -> bool:
-    """A fast check: one of the program names is in the text once quotes and
-    escape characters are removed (`r''m`, `r\\m`, `ch^mod`)."""
+    """A fast check to skip parsing: does the text plausibly hold a catastrophic
+    program? Quotes and escape characters are removed first (`r''m`, `r\\m`,
+    `ch^mod`). Broad on purpose: a false yes only costs one parse that finds
+    nothing; a false no would miss a real hit."""
     flat = re.sub(r"[\"'\\^`$]", "", command).lower()
-    return any(name in flat for name in _MENTION)
+    if any(name in flat for name in _MENTION):
+        return True
+    if "remove-item" in flat or "removedirs" in flat or "rmtree" in flat:
+        return True
+    if "$'" in command:                                # ANSI-C quoting can hide the program name
+        return True
+    if "$" in command and _VAR_FLAG_RE.search(command):   # `$R -rf /`, `ri -Recurse $HOME`
+        return True
+    return bool(_RF_FLAG_RE.search(command))           # a recursive-force flag: rm-like
 
 
-def catastrophic_hit(command: str) -> str:
-    """A plain description when the command, or code it runs, is a
-    catastrophic delete or permission change (module doc); "" when not."""
+def catastrophic_hit(command: str, cwd: Optional[str] = None) -> str:
+    """A plain description when the command, or code it runs, is a catastrophic
+    delete or permission change (module doc); "" when not. cwd is the folder the
+    command runs in, so `rm -rf *` counts when that folder is / or the home
+    folder."""
     if not isinstance(command, str) or not command.strip() or not _mentions(command):
         return ""
-    return _all_hit(command, 0)
+    return _all_hit(command, 0, cwd)

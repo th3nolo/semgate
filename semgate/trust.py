@@ -189,7 +189,7 @@ def hard_rule_hit(command: str) -> str:
         m = pattern.search(text)
         if m:
             return m.group(0)[:120]
-    return catastrophic.catastrophic_hit(command)[:120]
+    return (catastrophic.catastrophic_hit(command) or catastrophic.system_control_hit(command))[:120]
 
 
 def refuse_reason(command: str) -> str:
