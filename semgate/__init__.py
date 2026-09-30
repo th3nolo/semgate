@@ -3,7 +3,7 @@
 We judge. The host acts.
 """
 
-__version__ = "0.4.2"   # the one version: pyproject.toml reads it (dynamic = ["version"])
+__version__ = "0.4.3"   # the one version: pyproject.toml reads it (dynamic = ["version"])
 
 from .gate import Gate  # noqa: E402,F401  - the embed-in-your-own-agent entry point
 from .judge import Decision  # noqa: E402,F401
