@@ -1,11 +1,12 @@
 """Git state as a structural fact: what git can restore flows, what it cannot asks."""
 import os
+from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
 
-from semgate import Gate
+from semgate import Gate, catastrophic
 from semgate.gitstate import GitFacts, write_targets
 from semgate.providers.fake import FakeProvider
 
@@ -13,7 +14,13 @@ pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not ins
 
 
 @pytest.fixture()
-def repo(tmp_path):
+def repo(tmp_path, monkeypatch):
+    # The sibling outside.txt is unrecoverable by git but is deliberately in
+    # allowed scratch space. Windows TEMP can use an 8.3 alias while pytest
+    # resolves tmp_path to its long spelling; do not inherit that mismatch.
+    scratch = str(tmp_path.resolve())
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, scratch)
     r = tmp_path / "repo"
     r.mkdir()
     run = lambda *a: subprocess.run(["git", *a], cwd=r, check=True, capture_output=True)  # noqa: E731
@@ -76,6 +83,27 @@ def test_unrecoverable_targets_keep_the_gate_or_ask(repo):
     assert (d.decision, d.reason_code) == ("ask", "unrecoverable_write:dirty")
     # the same overwrite without git facts auto-runs: the hole this closes
     assert gate(repo, EDIT, facts=False).check("echo 'print(0)' > src/wip.py", user_message="fix the test", cwd=repo).decision == "allow"
+
+
+@pytest.mark.parametrize("facts", [True, False])
+@pytest.mark.parametrize("scratch_allowed", [True, False])
+def test_outside_delete_respects_scratch_scope_before_git_recovery(repo, monkeypatch, facts, scratch_allowed):
+    # An outside-repo file may still be in allowed scratch space. Control all
+    # scratch roots so /tmp on POSIX or inherited Windows temp aliases cannot
+    # silently decide which policy path this regression exercises.
+    monkeypatch.setattr(catastrophic, "_SCRATCH_DIRS", ())
+    scratch = Path(repo).parent if scratch_allowed else Path(repo)
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(scratch))
+    assert GitFacts().state("../outside.txt", repo).state == "outside"
+    provider = FakeProvider(ALLOW)
+    d = Gate(purpose="dev", provider=provider, project_root=repo, git_facts=facts).check(
+        "rm ../outside.txt", user_message="do it", cwd=repo)
+    if scratch_allowed:
+        assert (d.decision, d.stage) == ("ask", "human_gate")
+    else:
+        assert (d.decision, d.stage, d.reason_code) == ("deny", "hard_rules", "outside_project")
+    assert provider.calls == 0
 
 
 def test_non_file_destruction_is_never_relaxed(repo):
