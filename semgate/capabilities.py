@@ -16,11 +16,11 @@ def _parse_ts(value: Any) -> Optional[datetime]:
     """An RFC3339 timestamp with an explicit offset, or None (malformed)."""
     try:
         ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        if ts.tzinfo is None:
+            return None
+        return ts.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if ts.tzinfo is None:
-        return None
-    return ts
 
 def matches_capability(proposal: Mapping[str, Any], capability: Mapping[str, Any], *, now: datetime) -> bool:
     """Match exact action/target/scope against a trusted, unexpired capability.
@@ -45,11 +45,11 @@ def matches_capability(proposal: Mapping[str, Any], capability: Mapping[str, Any
     if expiry is None:
         return False
     now_utc = now.astimezone(timezone.utc)
-    if now_utc >= expiry.astimezone(timezone.utc):
+    if now_utc >= expiry:
         return False
     if capability.get("not_before") is not None:
         start = _parse_ts(capability["not_before"])
-        if start is None or now_utc < start.astimezone(timezone.utc):
+        if start is None or now_utc < start:
             return False
     if capability.get("revoked_at") is not None:
         return False

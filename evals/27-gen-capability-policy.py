@@ -44,7 +44,8 @@ Split: heldout.is_private(source_id); source_id is the family id, so all
 twelve siblings of a family share a split and cannot leak across it.
 Public -> fixtures/eval/capability-policy.jsonl (committed); private ->
 evals/private/capability-policy.jsonl (git-ignored). --check regenerates in
-memory and compares with the committed public file; --public-only writes the
+memory and compares with the committed public file and both splits' manifest
+metadata; --public-only writes the
 public file and the manifest and refuses when the private set would change.
 """
 from __future__ import annotations
@@ -54,7 +55,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -597,7 +598,7 @@ def build() -> List[Dict[str, Any]]:
     return cases
 
 
-def _text(cases: List[Dict[str, Any]]) -> str:
+def _text(cases: Sequence[Mapping[str, object]]) -> str:
     return "".join(json.dumps(c, sort_keys=True, ensure_ascii=False) + "\n" for c in cases)
 
 
@@ -609,7 +610,7 @@ def _write(path: Path, cases: List[Dict[str, Any]]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _counts(cases: List[Dict[str, Any]]) -> Dict[str, int]:
+def _counts(cases: Sequence[Mapping[str, object]]) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for c in cases:
         for key in (f"expected:{c['expected']}", f"kind:{c['counterfactual']}", f"primitive:{c['primitive']}"):
@@ -617,10 +618,39 @@ def _counts(cases: List[Dict[str, Any]]) -> Dict[str, int]:
     return dict(sorted(out.items()))
 
 
+def _manifest_matches(manifest: Mapping[str, object], public: Sequence[Mapping[str, object]],
+                      private: Sequence[Mapping[str, object]]) -> bool:
+    """Check both splits in memory without writing or scoring held-out cases."""
+    for name, rows, path, committed in (
+        ("public", public, PUBLIC_PATH, True),
+        ("private", private, PRIVATE_PATH, False),
+    ):
+        expected = {
+            "path": heldout.rel(path),
+            "committed": committed,
+            "sha256": hashlib.sha256(_text(rows).encode("utf-8")).hexdigest(),
+            "count": len(rows),
+            "label_counts": _counts(rows),
+        }
+        if manifest.get(name) != expected:
+            return False
+    cases = [*public, *private]
+    return (
+        manifest.get("name") == NAME
+        and manifest.get("schema") == SCHEMA
+        and manifest.get("decision_time") == NOW
+        and manifest.get("total") == {
+            "count": len(cases),
+            "families": len({c["family"] for c in cases}),
+            "label_counts": _counts(cases),
+        }
+    )
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--check", action="store_true",
-                    help="regenerate in memory and compare with the committed public file")
+                    help="regenerate in memory and check the public file and both splits' manifest metadata")
     ap.add_argument("--public-only", action="store_true",
                     help="write the public file and the manifest, never the private file; refuse if the private set changes")
     args = ap.parse_args(argv)
@@ -629,8 +659,14 @@ def main(argv=None) -> int:
     private = [c for c in cases if heldout.is_private(c["source_id"])]
     if args.check:
         same = PUBLIC_PATH.read_text(encoding="utf-8") == _text(public)
+        try:
+            manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+        manifest_ok = isinstance(manifest, dict) and _manifest_matches(manifest, public, private)
         print("public file matches" if same else "public file differs")
-        return 0 if same else 1
+        print("manifest matches" if manifest_ok else "manifest missing, invalid, or differs")
+        return 0 if same and manifest_ok else 1
     private_sha = hashlib.sha256(_text(private).encode("utf-8")).hexdigest()
     if args.public_only:
         old = json.loads(MANIFEST.read_text(encoding="utf-8")).get("private", {}).get("sha256")

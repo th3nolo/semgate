@@ -2,3 +2,6 @@
 # end of a line breaks bash). Found 2026-09-26 when a CRLF localci-wsl.sh
 # failed in WSL.
 *.sh text eol=lf
+
+# The capability corpus has a byte-level SHA256 pinned in its manifest.
+fixtures/eval/capability-policy.jsonl text eol=lf

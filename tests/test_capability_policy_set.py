@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "evals"))
@@ -60,7 +64,62 @@ def test_manifest_records_the_committed_hash():
     assert m["public"]["sha256"] == hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
     assert m["public"]["count"] == len(_cases())
     assert m["public"]["committed"] and not m["private"]["committed"]
-    assert m["total"]["families"] == len({c["family"] for c in _cases()} | {True}) - 1 or True
+    assert _gen().main(["--check"]) == 0
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_git_checkout_preserves_corpus_hash_with_autocrlf(tmp_path):
+    """Git's Windows checkout conversion must preserve the pinned bytes."""
+    import hashlib
+    gen = _gen()
+    public = [c for c in gen.build() if not heldout.is_private(c["source_id"])]
+    canonical = gen._text(public).encode("utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    (tmp_path / ".gitattributes").write_bytes((ROOT / ".gitattributes").read_bytes())
+    blob = subprocess.check_output(
+        ["git", "hash-object", "-w", "--stdin"], input=canonical, cwd=tmp_path,
+    ).decode("ascii").strip()
+    checkout = subprocess.check_output(
+        ["git", "-c", "core.autocrlf=true", "cat-file", "--filters",
+         "--path=fixtures/eval/capability-policy.jsonl", blob], cwd=tmp_path,
+    )
+    m = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    assert hashlib.sha256(checkout).hexdigest() == m["public"]["sha256"]
+
+
+@pytest.mark.parametrize("section,key,value", [
+    ("public", "sha256", "0" * 64),
+    ("private", "sha256", "0" * 64),
+    ("public", "count", 0),
+    ("private", "count", 0),
+    ("total", "count", 0),
+    ("total", "families", 0),
+    ("public", "label_counts", {}),
+    ("private", "label_counts", {}),
+    ("total", "label_counts", {}),
+    ("public", "committed", False),
+    ("private", "committed", True),
+    ("public", "path", "wrong.jsonl"),
+    ("private", "path", "wrong.jsonl"),
+])
+def test_manifest_check_rejects_corrupt_metadata(tmp_path, monkeypatch, section, key, value):
+    gen = _gen()
+    m = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    m[section][key] = value
+    path = tmp_path / "manifest.json"
+    original = json.dumps(m).encode("utf-8")
+    path.write_bytes(original)
+    monkeypatch.setattr(gen, "MANIFEST", path)
+    assert gen.main(["--check"]) == 1
+    assert path.read_bytes() == original, "--check must never rewrite the manifest"
+
+
+def test_manifest_check_rejects_invalid_json(tmp_path, monkeypatch):
+    gen = _gen()
+    path = tmp_path / "manifest.json"
+    path.write_text("{", encoding="utf-8")
+    monkeypatch.setattr(gen, "MANIFEST", path)
+    assert gen.main(["--check"]) == 1
 
 
 def test_every_family_has_all_counterfactuals_in_one_split():

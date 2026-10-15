@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+
+import pytest
+
 from semgate.capabilities import matches_capability
 
 NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
@@ -30,3 +33,22 @@ def test_extra_proposal_field_rejected():
 def test_missing_proposal_field_rejected():
     p={k:v for k,v in PROPOSAL.items() if k!="scope"}
     assert not matches_capability(p,CAP,now=NOW)
+
+
+@pytest.mark.parametrize("field", ["not_before", "expires_at"])
+@pytest.mark.parametrize("value", [
+    "9999-12-31T23:59:59-01:00",
+    "0001-01-01T00:00:00+01:00",
+])
+def test_timestamp_out_of_utc_range_rejected(field, value):
+    assert not matches_capability(PROPOSAL, {**CAP, field: value}, now=NOW)
+
+
+@pytest.mark.parametrize("field,value,expected", [
+    ("not_before", "2026-09-18T14:00:00+02:00", True),
+    ("not_before", "2026-09-18T14:00:01+02:00", False),
+    ("expires_at", "2026-09-18T14:00:00+02:00", False),
+    ("expires_at", "2026-09-18T14:00:01+02:00", True),
+])
+def test_validity_boundaries_with_non_utc_offsets(field, value, expected):
+    assert matches_capability(PROPOSAL, {**CAP, field: value}, now=NOW) is expected

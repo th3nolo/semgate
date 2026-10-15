@@ -47,10 +47,15 @@ declares real grants).
 
 ```
 python evals/run-capability-policy.py                 # public corpus, report on stdout, exit 2 on any false allow
-python evals/27-gen-capability-policy.py --check      # committed file matches the generator
+python evals/27-gen-capability-policy.py --check      # public file and both splits' manifest metadata match
 ```
 
 No model, no key, no paid calls.
+
+`--check` verifies hashes, counts, labels, paths, and split metadata against
+regeneration in memory. It never writes or scores the held-out split. Git
+preserves LF endings for the committed corpus even with `core.autocrlf=true`,
+so its pinned byte hash is the same on Linux and Windows.
 
 ## Freeze and append-only rules
 
