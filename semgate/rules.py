@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
-from . import adminguard, injection, linkplace, shellparse
+from . import adminguard, catastrophic, injection, linkplace, shellparse
 from .envelope import Envelope
 from .trust import TRUST_REQUEST_RE
 
@@ -193,22 +193,21 @@ _CODE_SEMGATE_RE = re.compile(r"\.semgate\b", re.IGNORECASE)
 # Commands that are denied outright regardless of grant or model opinion.
 # MULTILINE: the searched text has one argument per line, so `$` must match at
 # the end of the command's line, not only at the end of the whole text.
+# rm, shutdown and reboot are NOT text patterns here: a text search matched
+# `echo "rm -rf /"`, `grep -rn shutdown src/`, `git commit -m "fix reboot"` and
+# `rm -rf ~/project/build`. check_hard_deny parses them instead
+# (catastrophic.catastrophic_hit and catastrophic.system_control_hit), which
+# read the real program and target and skip data an echo/grep/commit only holds.
 HARD_DENY_PATTERNS: Tuple[re.Pattern, ...] = tuple(
     re.compile(p, re.IGNORECASE | re.MULTILINE)
     for p in (
-        r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/\s*$",      # rm -rf /
-        r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/\*",        # rm -rf /*
-        r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+~",          # rm -rf ~
         r"\bmkfs\b",
         r"\bdd\b[^\n]*\bof=/dev/",
         r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;",    # fork bomb
-        r"\bshutdown\b",
-        r"\breboot\b",
-        r"\b(stop|restart)-computer\b",             # PowerShell shutdown/restart
         # Windows / PowerShell / cmd catastrophic patterns. agy and Gemini CLI
-        # run these on Windows, where the Unix rm patterns above never match.
-        # Kept narrow: always-catastrophic tools, or a delete aimed at a drive
-        # root or a system directory - not ordinary in-project deletes.
+        # run these on Windows, where the parsed rm rule (catastrophic.py) covers
+        # the Unix spellings. Kept narrow: always-catastrophic tools, or a delete
+        # aimed at a drive root or a system directory - not ordinary in-project deletes.
         r"\bformat-volume\b",
         r"\bclear-disk\b",
         r"\bdiskpart\b",
@@ -684,11 +683,28 @@ def check_hard_deny(envelope: Envelope) -> RuleResult:
         match = pattern.search(text)
         if match:
             return RuleResult(outcome="deny", rule="hard_deny", detail=f"matches deny pattern: {match.group(0)!r}")
+    # Catastrophic deletes and permission changes in every spelling (rm -fr /,
+    # rm -r -f / --no-preserve-root, find / -delete, chmod -R 777 /, $R -rf /,
+    # find / | xargs rm -rf, shutil.rmtree("/"), Remove-Item -Recurse ~, through
+    # sudo, bash -c, python -c ...). Parsed, not matched as text (catastrophic.py).
+    # cwd lets `rm -rf *` count when the command runs in / or the home folder.
+    command = _command(envelope)
+    cwd = envelope.environment.cwd or envelope.environment.project_root or None
+    catastrophic_what = catastrophic.catastrophic_hit(command, cwd) or catastrophic.system_control_hit(command)
+    if catastrophic_what:
+        return RuleResult(outcome="deny", rule="hard_deny", detail=catastrophic_what)
+    # A destructive command (delete, move, copy-over, truncating redirect) whose
+    # target is outside the project folder, and outside the scratch/cache
+    # allowlist, is a hard deny by default: "clean node_modules" must not delete
+    # the global one. Reads are never scoped. Boundary: project_root, then cwd.
+    outside = catastrophic.outside_project_hit(command, envelope.environment.cwd or None,
+                                               envelope.environment.project_root or None)
+    if outside:
+        return RuleResult(outcome="deny", rule="outside_project", detail=outside)
     written = semgate_state_write(envelope) or semgate_state_code_write(_command(envelope))
     if written:
         return RuleResult(outcome="deny", rule="hard_deny",
                           detail=f"writes semgate's own state (a .semgate folder): {written!r}")
-    command = _command(envelope)
     # semgate's admin commands (init, uninstall, harness init, ...): only the
     # user runs them, in their own terminal (adminguard.py). Parsed, not
     # matched as text: quotes, escapes, paths, `python -m`, wrappers, runners
@@ -1019,6 +1035,37 @@ def detect_gates(envelope: Envelope, path_dirs: Sequence[str] = (), pins: Any = 
     if edit:
         hits.append(GateHit(gate_class="instruction_file_edit", matched=edit))
     return hits
+
+
+def script_catastrophic_deny(scripts: List["Any"], project_root: str = "") -> RuleResult:
+    """A catastrophic delete inside a local script the command runs
+    (scriptsource.ScriptFile) is a hard deny, the same as the inline command.
+    Unlike the denylist patterns (an ask, because a file holds names like
+    `def shutdown`), the parsed rule needs a real `rm -rf /` or `shutil.rmtree("/")`
+    call, so a file that only mentions one is not a hit. A destructive op in the
+    file whose target is outside the project folder is a hard deny too."""
+    from . import scriptsource
+    for script in scripts:
+        if not getattr(script, "content", ""):
+            continue
+        try:
+            # hard_text is the file plus the shell strings it passes to
+            # os.system / subprocess / exec (scriptsource.gate_texts): the same
+            # text the denylist patterns see.
+            hard_text, _ = scriptsource.gate_texts(script)
+        except Exception:
+            hard_text = script.content
+        run_cwd = getattr(script, "run_cwd", "") or project_root or None
+        try:
+            what = (catastrophic.catastrophic_hit(hard_text) or catastrophic.code_hit(hard_text)
+                    or catastrophic.system_control_hit(hard_text)
+                    or catastrophic.outside_project_hit(hard_text, run_cwd, project_root or None))
+        except Exception:
+            what = ""
+        if what:
+            return RuleResult(outcome="deny", rule="hard_deny",
+                              detail=f"in script {getattr(script, 'rel', '')}: {what}")
+    return RuleResult(outcome="none")
 
 
 def script_gate_hits(scripts: List["Any"], project_root: str = "", path_dirs: Sequence[str] = ()) -> List[GateHit]:

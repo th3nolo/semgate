@@ -50,18 +50,23 @@ from .envelope import Envelope
 MAX_SCRIPT_BYTES = 64 * 1024
 SOURCE_CONTEXT_CAP = 1500            # chars of marker passages added to untrusted_context
 
+# go is here because `go run x.go` compiles and runs in one command; the "run"
+# subcommand is dropped in invocations(). Rust/Java/.NET are not listed: they
+# have no inline eval and no single-command run-from-source semgate parses, so
+# reading their files is a separate feature (catastrophic.py notes this).
 _EXT = {"python": (".py",), "py": (".py",), "pypy": (".py",), "bash": (".sh",), "sh": (".sh",),
-        "node": (".js", ".mjs", ".cjs"), "ruby": (".rb",)}
-_KIND = {".py": "code", ".js": "code", ".mjs": "code", ".cjs": "code", ".rb": "code", ".sh": "shell"}
+        "node": (".js", ".mjs", ".cjs"), "ruby": (".rb",), "perl": (".pl", ".pm"), "go": (".go",)}
+_KIND = {".py": "code", ".js": "code", ".mjs": "code", ".cjs": "code", ".rb": "code", ".sh": "shell",
+         ".pl": "code", ".pm": "code", ".go": "code"}
 # Flags after which no script file follows (the code comes from elsewhere).
 _STOP = {"python": {"-c", "-m", "-"}, "py": {"-c", "-m", "-"}, "pypy": {"-c", "-m", "-"},
          "bash": {"-c", "-s", "-"}, "sh": {"-c", "-s", "-"},
-         "node": {"-e", "--eval", "-p", "--print", "-"}, "ruby": {"-e", "-"}}
+         "node": {"-e", "--eval", "-p", "--print", "-"}, "ruby": {"-e", "-"}, "perl": {"-e", "-E", "-"}}
 # Flags that take a value.
 _VALUE = {"python": {"-W", "-X", "-Q"}, "py": {"-W", "-X"}, "pypy": {"-W", "-X"},
           "bash": {"-o", "-O", "--rcfile", "--init-file"}, "sh": {"-o"},
           "node": {"-r", "--require", "--import", "--loader", "--experimental-loader", "--env-file", "--inspect-port"},
-          "ruby": {"-r", "-I", "-C", "-E"}}
+          "ruby": {"-r", "-I", "-C", "-E"}, "perl": {"-I", "-M"}}
 
 def _base(word: str) -> str:
     return word.replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -103,9 +108,15 @@ def invocations(command: str, cwd: str) -> List[Invocation]:
         exts = _EXT.get(prog)
         if not exts:
             continue
+        rest = argv[1:]
+        if prog == "go":
+            # only `go run <files>` executes; go build/test/vet do not run the code.
+            if not rest or rest[0].value != "run":
+                continue
+            rest = rest[1:]
         stop, value = _STOP.get(prog, set()), _VALUE.get(prog, set())
         skip = False
-        for tok in argv[1:]:
+        for tok in rest:
             v = tok.value
             if skip:
                 skip = False

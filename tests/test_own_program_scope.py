@@ -181,7 +181,9 @@ def test_other_paths_in_the_same_command_are_still_judged(install, tmp_path):
 def test_the_trust_gate_hard_rules_still_apply(install, tmp_path):
     own = _word(install / NAME)
     d = decide(tmp_path, f"{own} trust add 'rm -rf ~' --days 7")
-    assert (d.decision, d.stage, d.reason_code) == ("deny", "hard_rules", "hard_deny"), d.reasons
+    # rm -rf ~ is caught by the trust-add path (a hard-rule command can never be
+    # trusted), not by the removed over-broad text regex. Still a hard deny.
+    assert (d.decision, d.stage, d.reason_code) == ("deny", "hard_rules", "trust_hard_rule"), d.reasons
 
 
 def test_no_script_in_the_install_means_no_exception(tmp_path, monkeypatch):
