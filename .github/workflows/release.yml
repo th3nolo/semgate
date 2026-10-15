@@ -18,7 +18,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (released 2026-07-20)
         with:
           python-version: "3.12"
-      - run: python -m pip install "build==1.6.1" "twine==7.0.0"
+      # Twine's transitive more-itertools 11.2.1 was only 10 hours old on
+      # 2026-10-15. Keep the reviewed version that passes the 72-hour rule.
+      - run: python -m pip install "build==1.6.1" "twine==7.0.0" "more-itertools==11.1.0"
       # the tag must match the version: pyproject.toml has dynamic = ["version"]
       # (no [project] version key), read from semgate.__version__
       - run: |
