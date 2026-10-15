@@ -40,6 +40,7 @@ scores the rest.
 | chat-approval | 91 (75 public / 16 private) | our own (generated) | our own | committed `fixtures/eval/chat-approval.jsonl` |
 | trust-pin | 133 (public only) | our own (generated) | our own | committed `fixtures/eval/trust-pin.jsonl` |
 | trust-pin-validation | 29 (public only) | our own (generated) | our own | committed `fixtures/eval/trust-pin-validation.jsonl` |
+| capability-policy | 1080 (936 public / 144 private) | our own (generated) | our own | committed `fixtures/eval/capability-policy.jsonl` |
 
 Exact revisions and input hashes: see `THIRD_PARTY_NOTICES.md` and each set's
 manifest under `evals/`.

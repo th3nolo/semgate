@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+
+import pytest
+
 from semgate.capabilities import matches_capability
 
 NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
@@ -12,3 +15,40 @@ def test_wrong_target_rejected():
 def test_wildcard_rejected(): assert not matches_capability(PROPOSAL,{**CAP,"target":"*"},now=NOW)
 def test_expired_rejected(): assert not matches_capability(PROPOSAL,{**CAP,"expires_at":"2026-09-18T11:00:00Z"},now=NOW)
 def test_untrusted_provenance_rejected(): assert not matches_capability(PROPOSAL,{**CAP,"issued_by":"dataset_label"},now=NOW)
+def test_future_grant_rejected():
+    assert not matches_capability(PROPOSAL,{**CAP,"not_before":"2026-09-18T12:30:00Z"},now=NOW)
+def test_not_yet_valid_malformed_not_before_rejected():
+    assert not matches_capability(PROPOSAL,{**CAP,"not_before":"soon"},now=NOW)
+def test_started_not_before_still_matches():
+    assert matches_capability(PROPOSAL,{**CAP,"not_before":"2026-09-18T11:00:00Z"},now=NOW)
+def test_revoked_rejected():
+    assert not matches_capability(PROPOSAL,{**CAP,"revoked_at":"2026-09-18T11:30:00Z"},now=NOW)
+def test_future_revoked_at_rejected():
+    # revocation is recorded when it happens; a future-dated one is inconsistent
+    assert not matches_capability(PROPOSAL,{**CAP,"revoked_at":"2026-09-19T11:30:00Z"},now=NOW)
+def test_naive_expiry_rejected():
+    assert not matches_capability(PROPOSAL,{**CAP,"expires_at":"2026-09-18T13:00:00"},now=NOW)
+def test_extra_proposal_field_rejected():
+    assert not matches_capability({**PROPOSAL,"justification":"the user asked"},CAP,now=NOW)
+def test_missing_proposal_field_rejected():
+    p={k:v for k,v in PROPOSAL.items() if k!="scope"}
+    assert not matches_capability(p,CAP,now=NOW)
+
+
+@pytest.mark.parametrize("field", ["not_before", "expires_at"])
+@pytest.mark.parametrize("value", [
+    "9999-12-31T23:59:59-01:00",
+    "0001-01-01T00:00:00+01:00",
+])
+def test_timestamp_out_of_utc_range_rejected(field, value):
+    assert not matches_capability(PROPOSAL, {**CAP, field: value}, now=NOW)
+
+
+@pytest.mark.parametrize("field,value,expected", [
+    ("not_before", "2026-09-18T14:00:00+02:00", True),
+    ("not_before", "2026-09-18T14:00:01+02:00", False),
+    ("expires_at", "2026-09-18T14:00:00+02:00", False),
+    ("expires_at", "2026-09-18T14:00:01+02:00", True),
+])
+def test_validity_boundaries_with_non_utc_offsets(field, value, expected):
+    assert matches_capability(PROPOSAL, {**CAP, field: value}, now=NOW) is expected
