@@ -266,6 +266,9 @@ class PreparedBroker:
                             **({"approval_id": decision.evidence["approval_id"]} if decision.evidence.get("approval_id") else {})}
                 self.ensure_current()
                 self.task_request()
+                if self.sender.gate.grant.is_expired():
+                    return {"disposition": "deny", "reason_code": "development_operator_grant_expired",
+                            "delivery": "not_sent"}
                 execute = self.development.write if write is not None else self.development.run
                 result = execute(self.settings["project_root"], write if write is not None else command,
                                  protected=protected, expected_facts=facts)

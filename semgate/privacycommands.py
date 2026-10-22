@@ -75,6 +75,10 @@ def file_references(command: str) -> CommandFiles:
             values.append(raw if re.match(r"[A-Za-z]:[\\/]", raw) else token.value)
         program = values[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
         if program not in {"curl", "curl.exe"}:
+            if program in {"wget", "wget.exe", "nc", "ncat", "netcat"}:
+                # These transports can read local bodies through grammars we
+                # do not inspect. An empty finding set is not completeness.
+                result.problem("unsupported_transport")
             # PowerShell's file argument has a token boundary, too.
             for index, value in enumerate(values):
                 if value.lower() == "-infile":

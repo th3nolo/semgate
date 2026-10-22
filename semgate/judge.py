@@ -388,7 +388,8 @@ def judge(
         if ledger is not None:
             try:
                 if privacy_gate is not None:
-                    ledger.record_judgment(identity, decision, private=True)
+                    ledger.record_judgment(identity, decision, private=True,
+                                           seed=privacy_inspection.cleaner if privacy_inspection is not None else None)
                 else:
                     ledger.record_judgment(identity, decision)
             except LockTimeout:

@@ -34,6 +34,17 @@ def private_identity(key: bytes, field: str, value: str) -> str:
     return fingerprint(key, "privacy-ledger-" + field + "/1\x00" + json.dumps(value, ensure_ascii=True))
 
 
+def private_match(key: bytes, stored: Any, field: str, value: str) -> Optional[bool]:
+    """None means missing/incomparable history, never evidence of a mismatch."""
+    import hmac
+    expected = private_identity(key, field, value)
+    if (not isinstance(stored, str) or len(stored) != len(expected)
+            or stored.rsplit(":", 1)[0] != expected.rsplit(":", 1)[0]
+            or any(c not in "0123456789abcdef" for c in stored.rsplit(":", 1)[-1])):
+        return None
+    return hmac.compare_digest(stored, expected)
+
+
 class IncompleteWindow(RuntimeError):
     """The session-drift reader could not read every earlier judgment of the
     window (lock timeout, unreadable file, a malformed line that may belong
@@ -68,7 +79,7 @@ class Ledger:
         key = trustauth.key_for_store(self.path)
         return fingerprints.fingerprint(key, "privacy-ledger-turn/1\x00" + turn_key(envelope))
 
-    def record_judgment(self, envelope: Envelope, decision: "Any", *, private: bool = False) -> str:
+    def record_judgment(self, envelope: Envelope, decision: "Any", *, private: bool = False, seed: Any = None) -> str:
         record = {
             "record_type": "judgment",
             "judgment_id": decision.envelope_digest,
@@ -82,14 +93,21 @@ class Ledger:
                 private_turn = self._private_turn_id(record["envelope"])
                 from .feedback import _command_of, norm_root
                 from .trustauth import key_for_store
+                from .trust import inner_commands
+                from .privacydata import InputUnsafe, MAX_TEXT
                 key = key_for_store(self.path)
+                command = _command_of(envelope.action.arguments)
+                if len(command) > MAX_TEXT:
+                    raise InputUnsafe("private command exceeds inspection bounds")
                 identities = {"privacy_" + field + "_id": private_identity(key, field, value)
                               for field, value in (
-                                  ("command", _command_of(envelope.action.arguments)),
+                                  ("command", command),
                                   ("tool", envelope.action.tool),
                                   ("session", envelope.environment.session_id),
                                   ("project", norm_root(envelope.environment.project_root or envelope.environment.cwd)))}
-                record, _ = safe_inputs(record, {})
+                identities["privacy_trust_target_ids"] = [private_identity(key, "command", target)
+                                                         for target in inner_commands(command)]
+                record, _ = safe_inputs(record, {}, seed=seed)
                 record.update(identities)
                 record["privacy_minimized"] = True
                 record["privacy_turn_id"] = private_turn
