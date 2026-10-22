@@ -601,6 +601,9 @@ def _run_core(
         from . import pins as _pins
         pin_view = _pins.PinView(_pins.PinStore(_trust.store_path(config)), envelope.environment.project_root,
                                  envelope.environment.cwd)
+        if execution_paths is not None:
+            from .workerpaths import WorkerPinView
+            pin_view = WorkerPinView(execution_paths, pin_view.store)
     view = execution_paths.envelope(envelope) if execution_paths is not None else envelope
     sem = judge(view, policy, provider=provider, ledger=Ledger(ledger_path), history=learn_history, learn_min_count=min_count,
                 feedback=feedback, facts=facts, workspace=workspace, git_history=git_history, payload=payload,

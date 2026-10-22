@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Mapping
 from urllib.parse import unquote, urlsplit
 
 from .envelope import Envelope
-from .privacydata import InputUnsafe, MAX_TEXT, Minimizer
+from .privacydata import InputUnsafe, MAX_TEXT, Minimizer, json_value
 
 MAX_FILE_BYTES = 262144
 MAX_FILES = 8
@@ -35,6 +35,7 @@ class Inspection:
     cleaner: Minimizer = field(default_factory=Minimizer, repr=False)
     snapshots: Dict[Path, str] = field(default_factory=dict, repr=False)
     payloads: Dict[Path, bytes] = field(default_factory=dict, repr=False)
+    minimization_complete: bool = True
 
     def problem(self, code: str) -> None:
         self.complete = False
@@ -77,7 +78,7 @@ def inspect_content(cleaner: Minimizer, content: str, content_format: str = "") 
     if content_format == "jsonl":
         for line in content.splitlines():
             if line.strip():
-                cleaner.clean(json.loads(line))
+                cleaner.clean(json_value(line))
     elif content_format in ("csv", "tsv"):
         import csv
         import io
@@ -90,11 +91,11 @@ def inspect_content(cleaner: Minimizer, content: str, content_format: str = "") 
         except csv.Error as exc:
             raise InputUnsafe("uninspectable delimited content") from exc
     elif content_format == "json":
-        cleaner.clean(json.loads(content))
+        cleaner.clean(json_value(content))
     else:
         try:
-            value = json.loads(content)
-        except ValueError:
+            value = json_value(content)
+        except json.JSONDecodeError:
             return
         cleaner.clean(value)
 
@@ -111,6 +112,17 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
     if _OPAQUE.search(command):
         result.outgoing = True
         result.problem("opaque_program")
+    # A literal local write does not disclose its bytes, but its permission
+    # evaluator still needs sanitized structured input before any model call.
+    content = args.get("content")
+    if envelope.action.tool == "write" and isinstance(content, str):
+        suffix = Path(str(args.get("path", ""))).suffix.lower().lstrip(".")
+        if suffix in {"csv", "tsv", "json", "jsonl"}:
+            try:
+                inspect_content(result.cleaner, content, suffix)
+            except (ValueError, UnicodeError, RecursionError):
+                result.minimization_complete = False
+                result.problem("local_payload_uninspectable")
     if not result.outgoing:
         return result
     if len(text) > MAX_TEXT:
@@ -123,6 +135,7 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
         if decoded != text:
             result.cleaner.text(decoded)
     except InputUnsafe:
+        result.minimization_complete = False
         result.problem("payload_limit")
         return result
     for match in _URL.finditer(text):
@@ -196,7 +209,11 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
             if "\x00" in content:
                 result.problem("binary_file")
                 continue
-            inspect_content(result.cleaner, content, path.suffix.lower().lstrip("."))
+            try:
+                inspect_content(result.cleaner, content, path.suffix.lower().lstrip("."))
+            except (ValueError, UnicodeError, RecursionError):
+                result.minimization_complete = False
+                raise
             digest = hashlib.sha256(data).hexdigest()
             result.files.append({"source": f"file_{index + 1}", "bytes": len(data), "sha256": digest})
             result.snapshots[path] = digest

@@ -235,6 +235,8 @@ def judge(
                 raise ProviderError("privacy preflight requires review")
             from .providers.safe import SafeProvider
             if privacy_inspection is not None:
+                if not privacy_inspection.minimization_complete:
+                    raise ProviderError("privacy input minimization requires review")
                 # Seed from the locally inspected attachments as well as the
                 # model state: a name found in a CSV must also disappear from
                 # a user turn that refers to that same name.

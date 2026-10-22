@@ -9,6 +9,7 @@ from pathlib import Path
 import posixpath
 
 from .gitstate import GitFacts, GitHistory, HistoryVerdict, TargetState
+from .pins import PinView
 from .scriptsource import LocalWorkspace
 
 ROOT = "/workspace"
@@ -99,6 +100,19 @@ class WorkerWorkspace(LocalWorkspace):
             return (replace(source, path=ROOT+"/"+source.rel, run_cwd=cwd) if source else None), problem
         except ValueError:
             return None, "outside worker project"
+
+
+class WorkerPinView(PinView):
+    def __init__(self, paths, store):
+        super().__init__(store, str(paths.project), str(paths.project))
+        self.paths = paths
+
+    def resolve(self, path):
+        try:
+            host = self.paths.host(path.strip().strip("'\""))
+            return super().resolve(host)
+        except (ValueError, OSError):
+            return None
 
 
 class WorkerGitFacts(GitFacts):

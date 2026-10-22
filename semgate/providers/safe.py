@@ -39,7 +39,8 @@ def for_envelope(provider: Any, envelope: Any, *, prepared: Any = None, offline_
     try:
         from ..privacyinspect import inspect
         inspection = prepared.inspect(envelope) if prepared is not None else inspect(envelope)
-        return SafeProvider(provider, allow_calls=inspection.complete or offline_shell, seed=inspection.cleaner)
+        return SafeProvider(provider, allow_calls=inspection.minimization_complete and (inspection.complete or offline_shell),
+                            seed=inspection.cleaner)
     except Exception:
         return SafeProvider(provider, allow_calls=False)
 

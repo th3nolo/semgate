@@ -82,6 +82,7 @@ class PreparedSend:
         try:
             inspect_content(result.cleaner, text, self.content_format)
         except (ValueError, UnicodeError, RecursionError):
+            result.minimization_complete = False
             result.problem("payload_uninspectable")
         return result
 

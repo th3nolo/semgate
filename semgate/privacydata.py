@@ -7,7 +7,10 @@ Raw findings and the placeholder map live only for one decision.
 from __future__ import annotations
 
 import codecs
+import csv
 from copy import deepcopy
+import io
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -45,6 +48,22 @@ _LABELED = re.compile(
 
 class InputUnsafe(ValueError):
     """Inspection/minimization could not finish; never send a partial result."""
+
+
+def json_value(text: str) -> Any:
+    """Decode data without silently discarding an earlier object member."""
+    def unique(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise InputUnsafe("duplicate JSON member")
+            out[key] = value
+        return out
+    return json.loads(text, object_pairs_hook=unique)
+
+
+def _field_key(key: str) -> str:
+    return key.strip().lower().replace(" ", "_").replace("-", "_")
 
 
 @dataclass(frozen=True)
@@ -146,6 +165,52 @@ class Minimizer:
             self.values[value] = f"<PRIVATE_{category.upper()}_{self.counts[category]}>"
         return self.values[value]
 
+    def _learn_structured_text(self, value: str, depth: int) -> None:
+        """Learn labeled values in string containers before replacing them."""
+        if len(value) > MAX_TEXT:
+            raise InputUnsafe("privacy text limit exceeded")
+        text = value.lstrip("\ufeff \t\r\n")
+        if text.startswith(("{", "[")):
+            try:
+                parsed = json_value(text)
+            except json.JSONDecodeError:
+                lines = [line for line in text.splitlines() if line.strip()]
+                if len(lines) > 1 and all(line.lstrip().startswith('{"') for line in lines):
+                    try:
+                        parsed = [json_value(line) for line in lines]
+                    except json.JSONDecodeError:
+                        return
+                else:
+                    return
+            if isinstance(parsed, (Mapping, list)):
+                self.clean(parsed, depth=depth + 1)
+            return
+        if "\n" not in text and "\r" not in text:
+            return
+        first = text.splitlines()[0]
+        delimiter = "\t" if "\t" in first else ","
+        try:
+            headers = next(csv.reader([first], delimiter=delimiter), [])
+        except csv.Error:
+            return
+        if not any(_field_key(header) in FIELDS or (
+                re.fullmatch(r"[A-Za-z_][\w.-]{0,79}", header.strip())
+                and secretfinder.quoted_name(_field_key(header))) for header in headers):
+            return
+        try:
+            reader = csv.reader(io.StringIO(text), delimiter=delimiter, strict=True)
+            next(reader)
+            for row in reader:
+                if not row:
+                    continue
+                if len(row) != len(headers):
+                    raise InputUnsafe("uninspectable structured row")
+                # Per-column traversal preserves repeated labels as well.
+                for header, cell in zip(headers, row):
+                    self.clean(cell, key=header, depth=depth + 1)
+        except csv.Error as exc:
+            raise InputUnsafe("uninspectable structured text") from exc
+
     def text(self, value: str) -> str:
         if len(value) > MAX_TEXT:
             raise InputUnsafe("privacy text limit exceeded")
@@ -191,7 +256,9 @@ class Minimizer:
         self.nodes += 1
         if self.nodes > MAX_NODES or depth > MAX_DEPTH:
             raise InputUnsafe("privacy structure limit exceeded")
-        category = FIELDS.get(key.lower().replace(" ", "_").replace("-", "_"))
+        if isinstance(value, str):
+            self._learn_structured_text(value, depth)
+        category = FIELDS.get(_field_key(key))
         if category and value is not None and not isinstance(value, (Mapping, list, tuple)):
             raw = str(value)
             if len(raw) > MAX_TEXT:
@@ -210,8 +277,9 @@ class Minimizer:
                 raise InputUnsafe("privacy text limit exceeded")
             # Preserve the assignment context used by the existing detector;
             # a generic credential need not have a vendor-specific prefix.
-            if (secretfinder.quoted_name(key) and (secretfinder.quoted_value(value)
-                    or secretfinder.secret_name(key) and secretfinder.secret_value(value, key, True))):
+            normalized_key = _field_key(key)
+            if (secretfinder.quoted_name(normalized_key) and (secretfinder.quoted_value(value)
+                    or secretfinder.secret_name(normalized_key) and secretfinder.secret_value(value, normalized_key, True))):
                 self.remember("secret", value)
             return self.text(value)
         if isinstance(value, Mapping):
