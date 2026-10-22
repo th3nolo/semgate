@@ -28,14 +28,21 @@ class _HarnessGate(Gate):
     def __init__(self, broker: PreparedBroker) -> None:
         cfg = broker.config
         grant = UserGrant.from_dict(json.loads(Path(cfg["grant_file"]).read_text(encoding="utf-8")))
+        profiles = cfg.get("profiles")
+        if isinstance(profiles, dict) and profiles.get("enabled") is True:
+            from .antigravity_hook import configured_provider
+            from .profiles import resolve
+            grant, _, _ = resolve(grant, profiles, session_id=broker.settings["task_id"],
+                                  messages=[broker.task_request()], provider=configured_provider(cfg))
         super().__init__(grant.purpose, grant=grant, policy=cfg["policy_file"], provider="none",
                          project_root=broker.settings["project_root"], session_id=broker.settings["task_id"],
                          privacy_gate=PrivacyGate(consents=broker.consents, require_prepared=True))
         self.broker = broker
 
-    def check_prepared(self, prepared: PreparedSend):
+    def check_prepared(self, prepared: PreparedSend, *, consume_approval: bool = True):
         self.broker.ensure_current()
-        return harness.check_prepared(prepared, consents=self.broker.consents, config=self.broker.config_path)
+        return harness.check_prepared(prepared, consents=self.broker.consents, config=self.broker.config_path,
+                                      consume_approval=consume_approval)
 
 
 class _SnapshotTransport:
@@ -134,9 +141,10 @@ class PreparedBroker:
         evidence = decision.evidence.get("privacy", {})
         disposition = "deny" if decision.decision == "deny" else evidence.get("disposition", "needs_consent")
         if decision.decision != "allow" and disposition == "allow":
-            disposition = "needs_consent"
+            disposition = "needs_inspection"
         return {"disposition": disposition, "reason_code": decision.reason_code, "delivery": "not_sent",
-                **{k: evidence[k] for k in ("request_id", "grant_id") if evidence.get(k)}}
+                **{k: evidence[k] for k in ("request_id", "grant_id") if evidence.get(k)},
+                **({"approval_id": decision.evidence["approval_id"]} if decision.evidence.get("approval_id") else {})}
 
     def prepare(self, route_name: str) -> dict:
         self.ensure_current()
@@ -161,7 +169,7 @@ class PreparedBroker:
                 raise ValueError("prepared snapshot capacity reached")
             ident = secrets.token_hex(16)
             self.items[ident] = (prepared, time.monotonic() + self.ttl)
-        decision = self.sender.check(prepared)
+        decision = self.sender.gate.check_prepared(prepared, consume_approval=False)
         return dict(self._outcome(decision), prepared_id=ident, digest=prepared.digest)
 
     def dispatch(self, ident: str) -> dict:
@@ -180,13 +188,15 @@ class PreparedBroker:
                                     transport=_SnapshotTransport(self, expiry))
             receipt = sender.send(prepared)
             result = {**receipt.outcome.record(), "delivery": receipt.delivery, "digest": receipt.digest}
+            if receipt.approval_id:
+                result["approval_id"] = receipt.approval_id
             if receipt.status is not None:
                 result["status"] = receipt.status
             return dict(result, prepared_id=ident)
         finally:
             with self.lock:
                 self.busy.remove(ident)
-                if result["delivery"] == "not_sent" and result["disposition"] in {"needs_consent", "service_error"}:
+                if result["delivery"] == "not_sent" and result["disposition"] in {"needs_consent", "needs_inspection", "service_error"}:
                     self.items[ident] = (prepared, expiry)
                 else:
                     self.completed[ident] = (result, expiry)

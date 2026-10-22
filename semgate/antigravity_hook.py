@@ -386,6 +386,24 @@ def run(event: Mapping[str, Any], config: Mapping[str, Any], meta: Optional[Dict
 DEMO_NOTE = "[semgate DEMO: no TypeSafe key, recorded answers only; anything else asks] "
 
 
+def configured_provider(config: Mapping[str, Any]) -> Any:
+    """Provider selection shared by the hook and trusted snapshot preparation."""
+    name = str(config.get("provider") or "none")
+    provider = None
+    if name == "fake":
+        provider = FakeProvider(script=config.get("fake_answers") or {}, fail=bool(config.get("provider_fail")))
+    elif name in LIVE_PROVIDERS:
+        from .providers.registry import live_provider
+        provider = live_provider(name, str(config.get("judge_model") or "") or None)
+    elif name == "recorded":
+        from .providers.recorded import RecordedProvider
+        provider = RecordedProvider()
+    elif name != "none":
+        raise ValueError(f"unknown provider {name!r}")
+    from .providers.safe import configured
+    return configured(provider, config)
+
+
 def run_core(config: Mapping[str, Any], **kwargs: Any) -> Dict[str, Any]:
     """The pipeline (_run_core). In demo mode (provider "recorded") every
     reason the host shows starts with DEMO_NOTE, so nobody mistakes a demo
@@ -436,6 +454,7 @@ def _run_core(
     consent_store: Any = None,
     trusted_offline_shell: bool = False,
     trusted_execution_facts: Any = None,
+    execution_paths: Any = None,
 ) -> Dict[str, Any]:
     """Host-neutral decision pipeline shared by every hook adapter.
 
@@ -485,41 +504,28 @@ def _run_core(
     # up to 0.4.0; str(None) would be the unknown provider 'None' and ask on
     # every call, the deterministic denies included.
     provider_name = str(config.get("provider") or "none")
-    provider = None
-    if provider_name == "fake":
-        provider = FakeProvider(script=config.get("fake_answers") or {}, fail=bool(config.get("provider_fail")))
-    elif provider_name in LIVE_PROVIDERS:
-        # typesafe or openrouter (providers/registry.py); semgate.json may pin
-        # the model with judge_model, else the provider's default.
-        from .providers.registry import live_provider
-        provider = live_provider(provider_name, str(config.get("judge_model") or "") or None)
-    elif provider_name == "recorded":
-        # Demo mode without a key (`semgate init <host> --demo`): only the
-        # recording shipped with semgate, never a file named in the config.
-        # Any input not in it has no answer, so the judge asks (fails closed).
-        from .providers.recorded import RecordedProvider
-        provider = RecordedProvider()
-    elif provider_name != "none":
+    if provider_name not in {"none", "fake", "recorded", *LIVE_PROVIDERS}:
         return enforce_cfg.fail_closed(f"semgate: unknown provider {provider_name!r}", chat_host, config, ask_as=ask_word)
+    provider = configured_provider(config)
     from .privacy import from_config as privacy_from_config
-    from .providers.safe import configured as privacy_provider
     privacy_gate = privacy_from_config(config)
     if privacy_gate is not None and prepared_disclosure is not None:
         privacy_gate.consents = consent_store
-    provider = privacy_provider(provider, config)
     # Work kinds: the purpose Jev judges against is composed from every kind of
     # work the user has asked for this session (see profiles.py). The grant's
     # hard scope (forbidden patterns, expiry) is untouched; kinds may only add
     # the operator's declared domains.
     prof_cfg = config.get("profiles") if isinstance(config.get("profiles"), Mapping) else {}
-    kinds = table = None
-    if prof_cfg.get("enabled") is True:
-        from . import profiles as _profiles
-        table = _profiles.load_profiles(str(prof_cfg.get("file") or "") or None)
-        kinds = _profiles.session_kinds(prof_cfg, session_id=session_id, messages=user_messages(),
-                                        provider=provider, table=table)
-        grant = _profiles.apply(grant, kinds, table)
+    from . import profiles as _profiles
+    grant, kinds, table = _profiles.resolve(grant, prof_cfg, session_id=session_id,
+                                           messages=user_messages(), provider=provider)
     envelope = build_envelope(grant)
+    if execution_paths is not None:
+        from .devworker import VerifiedOfflineFacts
+        from .workerpaths import WorkerPaths
+        if (not trusted_offline_shell or not isinstance(trusted_execution_facts, VerifiedOfflineFacts)
+                or not isinstance(execution_paths, WorkerPaths)):
+            raise ValueError("worker path mapping requires verified private execution")
     from .sendclient import verified_invocation
     trusted_send_client = verified_invocation(envelope, config)
     # semgate's own earlier answers in this session, which the host shows as
@@ -551,10 +557,17 @@ def _run_core(
         # from the command or the envelope's tool arguments.
         facts = GitFacts(agent_files=store if agent_files_enabled(config) else None,
                          session_id=session_id, project_root=envelope.environment.project_root)
+        if execution_paths is not None:
+            from .workerpaths import WorkerGitFacts
+            facts = WorkerGitFacts(execution_paths, agent_files=store if agent_files_enabled(config) else None,
+                                   session_id=session_id)
     workspace = None
     if script_source_enabled(config):
         from .scriptsource import LocalWorkspace
         workspace = LocalWorkspace()
+        if execution_paths is not None:
+            from .workerpaths import WorkerWorkspace
+            workspace = WorkerWorkspace(execution_paths)
     git_history = None
     if policy.kind == "router" and codesignals.S1_ID in router_mod.enabled_code_signals(policy):
         # G2/S1: git log runs only when the command rewrites history, and the
@@ -571,6 +584,9 @@ def _run_core(
             known = [b for b in bounds if b is not None]
             return min(known) if known else None
         git_history = GitHistory(session_start=session_start)
+        if execution_paths is not None:
+            from .workerpaths import WorkerGitHistory
+            git_history = WorkerGitHistory(execution_paths, session_start=session_start)
     learn_history = history if learned.get("enabled") is True else None   # recording outcomes never turns on learning
     trust_store = None
     pin_view = None
@@ -581,14 +597,16 @@ def _run_core(
         from . import pins as _pins
         pin_view = _pins.PinView(_pins.PinStore(_trust.store_path(config)), envelope.environment.project_root,
                                  envelope.environment.cwd)
-    sem = judge(envelope, policy, provider=provider, ledger=Ledger(ledger_path), history=learn_history, learn_min_count=min_count,
+    view = execution_paths.envelope(envelope) if execution_paths is not None else envelope
+    sem = judge(view, policy, provider=provider, ledger=Ledger(ledger_path), history=learn_history, learn_min_count=min_count,
                 feedback=feedback, facts=facts, workspace=workspace, git_history=git_history, payload=payload,
                 extra_evidence=extra_evidence, trust=trust_store, pins=pin_view,
                 # The hook runs as a child of the agent CLI: this PATH is the one
                 # the agent's commands use (folders on it count for persistence_link).
                 path_env=os.environ.get("PATH", ""), privacy_gate=privacy_gate, prepared_disclosure=prepared_disclosure,
                 trusted_send_client=trusted_send_client, trusted_offline_shell=trusted_offline_shell,
-                trusted_execution_facts=trusted_execution_facts)
+                trusted_execution_facts=trusted_execution_facts, execution_paths=execution_paths,
+                authority_envelope=envelope if execution_paths is not None else None)
     # A command from a project instruction file whose lines the user has not
     # pinned (pingate.py). On the retry after semgate's question, the user's
     # yes in chat pins exactly the lines semgate quoted; then the same action
@@ -602,7 +620,8 @@ def _run_core(
                         session_started_at=session_started_at, payload=payload, store_problems=store_problems,
                         extra_evidence=extra_evidence, chat=chat, _after_pin=True,
                         prepared_disclosure=prepared_disclosure, consent_store=consent_store,
-                        trusted_offline_shell=trusted_offline_shell, trusted_execution_facts=trusted_execution_facts)
+                        trusted_offline_shell=trusted_offline_shell, trusted_execution_facts=trusted_execution_facts,
+                        execution_paths=execution_paths)
     from .filelock import LockTimeout
     lock_failures: List[str] = []
     step_for_record = step_idx if record_step == "__same__" else record_step

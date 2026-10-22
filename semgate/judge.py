@@ -143,6 +143,8 @@ def judge(
     trusted_send_client: bool = False,
     trusted_offline_shell: bool = False,
     trusted_execution_facts: Any = None,
+    execution_paths: Any = None,
+    authority_envelope: Any = None,
 ) -> Decision:
     """`facts` (a gitstate.GitFacts) enables the git-state check: a delete or
     overwrite whose targets git can restore skips the destructive gate, and a
@@ -182,8 +184,19 @@ def judge(
     None (the default, and every eval runner unless the case sets a fake PATH):
     the fixed list only, so a decision never depends on the machine's PATH."""
     started = time.monotonic()
+    identity = envelope
+    if execution_paths is not None:
+        from .devworker import VerifiedOfflineFacts
+        from .workerpaths import WorkerPaths
+        if (not trusted_offline_shell or not isinstance(trusted_execution_facts, VerifiedOfflineFacts)
+                or not isinstance(execution_paths, WorkerPaths) or authority_envelope is None
+                or execution_paths.envelope(authority_envelope).to_dict() != envelope.to_dict()):
+            raise ValueError("worker path mapping requires its verified host authority")
+        identity = authority_envelope
+    elif authority_envelope is not None:
+        raise ValueError("host authority requires a worker path mapping")
     evaluated_at = envelope.evaluated_at or utcnow_iso()
-    digest = envelope.digest()
+    digest = identity.digest()
     provider_name = provider.name if provider else "none"
     judge_model = provider_model(provider)
     served_calls: List[Dict[str, str]] = []     # served_of() of each answered call of this decision
@@ -253,7 +266,7 @@ def judge(
         if decision.stage not in learn_stages or decision.gate_hits:
             return decision
         try:
-            count = history.count_executed_after_ask(envelope.action.tool, envelope.action.arguments)
+            count = history.count_executed_after_ask(identity.action.tool, identity.action.arguments)
         except Exception:  # an unreadable history store must not become an allow
             return decision
         if count < learn_min_count:
@@ -275,9 +288,9 @@ def judge(
     def _human_decision() -> Optional[str]:
         if feedback is None:
             return None
-        env = envelope.environment
+        env = identity.environment
         try:
-            return feedback.latest(envelope.action.tool, envelope.action.arguments,
+            return feedback.latest(identity.action.tool, identity.action.arguments,
                                    session_id=env.session_id, project_root=env.project_root or env.cwd)
         except Exception as exc:  # unreadable (lock timeout, I/O): a human deny may be hidden
             return "unreadable:" + type(exc).__name__
@@ -343,7 +356,7 @@ def judge(
         # injection_deny threshold, or the user asked): the trust is not used.
         if any((v.get("predicate"), v.get("vote")) == ("instructed_by_context", "injected") for v in decision.predicate_votes):
             return decision
-        env = envelope.environment
+        env = identity.environment
         project = trust_mod.project_of(env.project_root or env.cwd)
         try:
             rec = trust.lookup(command, project)
@@ -375,9 +388,9 @@ def judge(
         if ledger is not None:
             try:
                 if privacy_gate is not None:
-                    ledger.record_judgment(envelope, decision, private=True)
+                    ledger.record_judgment(identity, decision, private=True)
                 else:
-                    ledger.record_judgment(envelope, decision)
+                    ledger.record_judgment(identity, decision)
             except LockTimeout:
                 # The judgment is kept in a spill file (filelock.append_record);
                 # the ledger could not take it in time. Fail closed.
@@ -413,7 +426,7 @@ def judge(
     #     the user a question, the to-do list): allowed by code, inside the
     #     grant's scope. Before the pattern rules: their arguments are text
     #     for the person, not an action (harnesstools.py).
-    if harnesstools.display_allow(envelope) and not rules.check_grant_scope(envelope):
+    if harnesstools.display_allow(envelope) and not rules.check_grant_scope(envelope, path_view=execution_paths):
         return finish(Decision(
             decision="allow",
             reasons=[f"harness tool '{envelope.action.tool}': {harnesstools.tools_text(envelope.action.tool)}"],
@@ -423,7 +436,7 @@ def judge(
         ))
 
     # 1. Hard deny: grant-scope violations and denylisted commands. No model.
-    hard = rules.check_hard_deny(envelope, trusted_send_client=trusted_send_client)
+    hard = rules.check_hard_deny(envelope, trusted_send_client=trusted_send_client, path_view=execution_paths)
     if hard.outcome == "deny":
         return finish(Decision(
             decision="deny",
@@ -451,7 +464,7 @@ def judge(
                                     "allow": skill.allow, "why": skill.why}
     for where, line in harnesstools.inner_commands(envelope, skill):
         derived = harnesstools.command_envelope(envelope, line)
-        hard_line = rules.check_hard_deny(derived)
+        hard_line = rules.check_hard_deny(derived, path_view=execution_paths)
         if hard_line.outcome == "deny":
             return finish(Decision(
                 decision="deny",
@@ -583,7 +596,7 @@ def judge(
         line_gates: List[Any] = []
         for line in test_ev.lines:
             derived = testrun.derived_envelope(envelope, line)
-            hard_line = rules.check_hard_deny(derived)
+            hard_line = rules.check_hard_deny(derived, path_view=execution_paths)
             if hard_line.outcome == "deny":
                 return finish(Decision(
                     decision="deny",
@@ -626,7 +639,8 @@ def judge(
         ))
 
     # 3. Hard allow: small conservative read-only set, fully in scope.
-    easy = rules.check_hard_allow(envelope, allow_tools=policy.hard_allow_tools or rules.DEFAULT_HARD_ALLOW_TOOLS)
+    easy = rules.check_hard_allow(envelope, allow_tools=policy.hard_allow_tools or rules.DEFAULT_HARD_ALLOW_TOOLS,
+                                  path_view=execution_paths)
     if easy.outcome == "allow":
         return finish(Decision(
             decision="allow",
@@ -867,7 +881,7 @@ def judge(
         window_gap = ""
         if earlier is None and ledger is not None:
             try:
-                earlier = ledger.session_on_task(envelope, exclude=digest)
+                earlier = ledger.session_on_task(identity, exclude=digest)
             except IncompleteWindow as exc:
                 earlier, window_gap = [], str(exc)
             except Exception as exc:

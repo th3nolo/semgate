@@ -54,6 +54,13 @@ class Ledger:
         file, unless spill is False); callers fail closed."""
         filelock.append_record(self.path, record, spill=spill)
 
+    def _private_turn_id(self, envelope: Dict[str, Any]) -> str:
+        from . import fingerprints, trustauth
+        # A keyed identity preserves turn boundaries without storing or
+        # exposing a guessable hash of a user's private request.
+        key = trustauth.key_for_store(self.path)
+        return fingerprints.fingerprint(key, "privacy-ledger-turn/1\x00" + turn_key(envelope))
+
     def record_judgment(self, envelope: Envelope, decision: "Any", *, private: bool = False) -> str:
         record = {
             "record_type": "judgment",
@@ -65,8 +72,10 @@ class Ledger:
         if private:
             from .privacydata import safe_inputs
             try:
+                private_turn = self._private_turn_id(record["envelope"])
                 record, _ = safe_inputs(record, {})
                 record["privacy_minimized"] = True
+                record["privacy_turn_id"] = private_turn
                 if record["envelope"]["environment"].get("session_id") != envelope.environment.session_id:
                     record["privacy_session_unattributed"] = True
             except Exception:
@@ -248,6 +257,7 @@ class Ledger:
         start = raw.rfind(b"\n", 0, first) + 1          # the session's first line
         key = turn_key(envelope.to_dict())
         out: List[float] = []
+        private_turn = None
         parsed = filelock.parse_jsonl_bytes(raw[start:])
         if parsed.malformed or parsed.partial_tail:
             raise IncompleteWindow(f"{len(parsed.malformed) + int(parsed.partial_tail)} malformed line(s) since this session's first record")
@@ -256,13 +266,32 @@ class Ledger:
                 continue
             env = r.get("envelope") or {}
             d = r.get("decision") or {}
-            if (r.get("privacy_minimized") and str((env.get("environment") or {}).get("session_id", "")) == sid
-                    and not (exclude and r.get("judgment_id") == exclude)
-                    and (r.get("privacy_window_incomplete") or (d.get("stage") == "semantic" and turn_key(env) != key))):
-                raise IncompleteWindow("privacy-minimized history cannot establish the user-turn window")
             if (str((env.get("environment") or {}).get("session_id", "")) != sid
-                    or d.get("stage") != "semantic" or (exclude and r.get("judgment_id") == exclude)
-                    or turn_key(env) != key):
+                    or (exclude and r.get("judgment_id") == exclude)):
+                continue
+            if r.get("privacy_minimized"):
+                if r.get("privacy_window_incomplete"):
+                    raise IncompleteWindow("privacy-minimized history cannot establish the user-turn window")
+                if d.get("stage") != "semantic":
+                    continue
+                if r.get("privacy_turn_id"):
+                    if private_turn is None:
+                        try:
+                            private_turn = self._private_turn_id(envelope.to_dict())
+                        except Exception as exc:
+                            raise IncompleteWindow("privacy-minimized turn identity unavailable") from exc
+                    stored_turn = r["privacy_turn_id"]
+                    if (not isinstance(stored_turn, str) or len(stored_turn) != len(private_turn)
+                            or stored_turn.rsplit(":", 1)[0] != private_turn.rsplit(":", 1)[0]
+                            or any(c not in "0123456789abcdef" for c in stored_turn.rsplit(":", 1)[-1])):
+                        raise IncompleteWindow("privacy-minimized turn identity cannot be compared")
+                    if r["privacy_turn_id"] != private_turn:
+                        continue
+                elif turn_key(env) != key:
+                    # Legacy minimized records cannot reliably distinguish an
+                    # old turn from a redacted current turn. Do not drop them.
+                    raise IncompleteWindow("privacy-minimized history cannot establish the user-turn window")
+            elif d.get("stage") != "semantic" or turn_key(env) != key:
                 continue
             p = next((v.get("p") for v in d.get("predicate_votes") or [] if v.get("predicate") == "on_task"), None)
             if isinstance(p, (int, float)):

@@ -349,7 +349,8 @@ def _ledger_event(config: Mapping[str, Any], event: str, detail: Dict[str, Any])
 
 def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optional[Dict[str, Any]] = None,
                 line_bytes: int = 0, *, prepared: Any = None, consents: Any = None,
-                offline_shell: bool = False, execution_facts: Any = None) -> Dict[str, Any]:
+                offline_shell: bool = False, execution_facts: Any = None,
+                consume_approval: bool = True, execution_paths: Any = None) -> Dict[str, Any]:
     """One check through run_core and the approval step. `req` is validated
     here (again). Returns the answer object (not yet recorded as
     host_response: the caller does that, as serve does). Raises on errors;
@@ -377,6 +378,7 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
         chat=None,       # no approval by chat reply on this path (see the module text)
         prepared_disclosure=prepared, consent_store=consents, trusted_offline_shell=offline_shell,
         trusted_execution_facts=execution_facts,
+        execution_paths=execution_paths,
     )
     decision = _TO_HOST.get(str(result.get("decision")), "ask")
     reason = str(result.get("reason", ""))
@@ -388,12 +390,13 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
                            "judgment_id": str(meta.get("content_digest", "") or "")}
     env = built.get("envelope")
     if env is not None and decision in ("allow", "ask") and not meta.get("privacy_blocked"):
-        out = _approval_step(out, env, config, req, meta)
+        out = _approval_step(out, env, config, req, meta, consume=consume_approval)
     out["reason"] = public_text(out["reason"])[:1000]
     return out
 
 
-def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path]) -> Any:
+def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path],
+                   consume_approval: bool = True) -> Any:
     """Trusted broker path through the complete hook/harness pipeline, synchronously.
 
     This function only judges. PreparedSender owns dispatch; a caller deadline
@@ -403,17 +406,19 @@ def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path]) ->
     cfg = load_config(config)
     if cfg.get("mode") != "enforce":
         return Decision("deny", stage="privacy", reason_code="prepared_harness_requires_enforce")
+    task_request = _task_request(cfg, prepared.scope.task, prepared.scope.project)
     req = validate_request({"tool": "http_request", "arguments": prepared.arguments(),
                             "session_id": prepared.scope.task, "project_root": prepared.scope.project,
                             "cwd": prepared.scope.project,
-                            "user_message": _task_request(cfg, prepared.scope.task, prepared.scope.project)})
+                            "user_message": task_request, "user_messages": [task_request]})
     meta: Dict[str, Any] = {}
-    out = judge_check(req, cfg, meta, prepared=prepared, consents=consents)
-    if meta.get("judged_decision") != "allow" and out["decision"] == "allow":
-        out = dict(out, decision="ask")
+    out = judge_check(req, cfg, meta, prepared=prepared, consents=consents, consume_approval=consume_approval)
+    # judge_check settles only ordinary approvable asks, after privacy passes.
+    # Keep that authorized result; preparation previews do not consume it.
     out = _record_answer(cfg, req, out, meta)
     return Decision(out["decision"], reasons=[out["reason"]], stage=out["stage"], reason_code=out["reason_code"],
-                    envelope_digest=out["judgment_id"], evidence={"privacy": meta.get("prepared_privacy", {})})
+                    envelope_digest=out["judgment_id"], evidence={"privacy": meta.get("prepared_privacy", {}),
+                                                               "approval_id": out.get("approval_id", "")})
 
 
 def _task_request(config: dict, task: str, project: str) -> str:
@@ -449,23 +454,27 @@ def _check_development(tool: str, arguments: dict, *, project: str, task: str, c
     # than asking the model to guess whether a shell overwrite loses work.
     # GitFacts is read-only; dirty/untracked targets still withhold an allow.
     # Keep the public check API and unverified judgment path unchanged.
+    paths = None
     if execution_facts is not None:
         from .devworker import VerifiedOfflineFacts
         if not isinstance(execution_facts, VerifiedOfflineFacts):
             raise ValueError("verified execution facts required")
         cfg = dict(cfg, git_facts=True)
+        from .workerpaths import WorkerPaths
+        paths = WorkerPaths(project)
+    task_request = _task_request(cfg, task, project)
     req = validate_request({"tool": tool, "arguments": arguments,
                             "session_id": task, "project_root": project, "cwd": project,
-                            "user_message": _task_request(cfg, task, project)})
+                            "user_message": task_request, "user_messages": [task_request]})
     meta: Dict[str, Any] = {}
     out = _record_answer(cfg, req, judge_check(req, cfg, meta, offline_shell=True,
-                                            execution_facts=execution_facts), meta)
+                                            execution_facts=execution_facts, execution_paths=paths), meta)
     return Decision(out["decision"], reasons=[out["reason"]], stage=out["stage"], reason_code=out["reason_code"],
                     evidence={"approval_id": out.get("approval_id", "")})
 
 
 def _approval_step(out: Dict[str, Any], env: Any, config: Mapping[str, Any], req: Mapping[str, Any],
-                   meta: Mapping[str, Any]) -> Dict[str, Any]:
+                   meta: Mapping[str, Any], *, consume: bool = True) -> Dict[str, Any]:
     from . import approvals
     from .chatapproval import envelope_key
     store = approvals.store_for(config)
@@ -476,7 +485,7 @@ def _approval_step(out: Dict[str, Any], env: Any, config: Mapping[str, Any], req
     try:
         res = store.settle(key=envelope_key(env), session_id=req["session_id"], project_root=root, final=out["decision"],
                            summary=_summary(env), tool=env.action.tool, reason_code=out["reason_code"],
-                           judgment_id=out["judgment_id"], approvable=approvable)
+                           judgment_id=out["judgment_id"], approvable=approvable, consume=consume)
     except Exception as exc:
         # The store may hold a human "no": an allow becomes an ask; an ask
         # stays an ask without an approval id.
@@ -493,10 +502,13 @@ def _approval_step(out: Dict[str, Any], env: Any, config: Mapping[str, Any], req
                     reason=(f"semgate: a human said no to this exact action (approval {rec.get('approval_id')}, "
                             f"by {rec.get('by', '')}). | " + out["reason"])[:1000])
     if effect == "allow":
-        _ledger_event(config, "used", dict(base, by=rec.get("by", "")))
-        return dict(out, decision="allow", reason_code="human_approved_once", approval_id=rec.get("approval_id"),
+        if consume:
+            _ledger_event(config, "used", dict(base, by=rec.get("by", "")))
+        status = "now used" if consume else "ready for dispatch"
+        return dict(out, decision="allow", reason_code="human_approved_once" if consume else "human_approval_ready",
+                    approval_id=rec.get("approval_id"),
                     reason=(f"semgate: approved once by {rec.get('by', '')} (approval {rec.get('approval_id')}); "
-                            f"this approval is now used. Was: " + out["reason"])[:1000])
+                            f"this approval is {status}. Was: " + out["reason"])[:1000])
     if effect == "pending":
         if res.get("new"):
             _ledger_event(config, "pending", base)

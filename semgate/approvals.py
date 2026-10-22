@@ -133,7 +133,7 @@ class ApprovalStore:
     # ---------- check side ----------
     def settle(self, *, key: str, session_id: str, project_root: str, final: str, now: Optional[float] = None,
                summary: str = "", tool: str = "", reason_code: str = "", judgment_id: str = "",
-               approvable: bool = True) -> Dict[str, Any]:
+               approvable: bool = True, consume: bool = True) -> Dict[str, Any]:
         """The approval step of one check, after the pipeline's answer `final`
         (allow / ask / deny). Returns {"effect": ..., "record": ...}:
           "deny"    a human denied this action (final was allow or ask)
@@ -143,7 +143,9 @@ class ApprovalStore:
                     an ask that is not `approvable`)
         `approvable` False (the judge said deny, e.g. in shadow mode, or the
         grant expired): a human no still applies; nothing is approved or
-        recorded, like `semgate feedback allow` never opens those."""
+        recorded, like `semgate feedback allow` never opens those.
+        `consume=False` previews an approval for preparation; dispatch must
+        settle it again with consumption under this same cross-process lock."""
         t = time.time() if now is None else float(now)
         root = norm_root(project_root)
         if not session_id or not root:
@@ -160,8 +162,9 @@ class ApprovalStore:
             approved = [r for r in mine if r.get("status") == "approved"]
             if approved:
                 r = approved[-1]
-                r["status"], r["used"] = "used", t
-                self._save(items)
+                if consume:
+                    r["status"], r["used"] = "used", t
+                    self._save(items)
                 return {"effect": "allow", "record": dict(r)}
             pending = [r for r in mine if r.get("status") == "pending"]
             if pending:

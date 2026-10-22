@@ -16,7 +16,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from .privacyconsent import ConsentOutcome, DisclosureScope, POLICY_VERSION, validate_categories
+from .privacyconsent import ConsentOutcome, DisclosureScope, POLICY_VERSION, canonical_purpose, validate_categories
 from .privacydata import MAX_TEXT
 from .privacyinspect import Inspection, inspect
 
@@ -85,7 +85,8 @@ class PreparedSend:
     def matches(self, envelope: Envelope) -> bool:
         from .feedback import norm_root
         return (envelope.action.tool == "http_request" and dict(envelope.action.arguments) == self.arguments()
-                and envelope.grant.principal == self.scope.principal and envelope.grant.purpose == self.scope.purpose
+                and envelope.grant.principal == self.scope.principal
+                and canonical_purpose(envelope.grant.purpose) == self.scope.purpose
                 and norm_root(envelope.environment.project_root) == self.scope.project)
 
 
@@ -127,6 +128,7 @@ class SendReceipt:
     delivery: str = "not_sent"  # response_received | unknown (transport failure after dispatch)
     status: Optional[int] = None
     digest: str = ""
+    approval_id: str = ""
 
 
 class PreparedSender:
@@ -179,8 +181,9 @@ class PreparedSender:
             disposition = "deny" if decision.decision == "deny" else privacy.get("disposition", "needs_consent")
             if disposition == "allow":
                 # Privacy consent cannot soften an ordinary permission ask.
-                disposition = "needs_consent"
-            return SendReceipt(ConsentOutcome(disposition, decision.reason_code, privacy.get("request_id", "")), digest=prepared.digest)
+                disposition = "needs_inspection"
+            return SendReceipt(ConsentOutcome(disposition, decision.reason_code, privacy.get("request_id", "")),
+                               digest=prepared.digest, approval_id=decision.evidence.get("approval_id", ""))
         # Permission is checked again above; consent is re-read under the same
         # cross-process lock used by revocation and task closure at dispatch.
         dispatched = False

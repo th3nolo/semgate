@@ -30,6 +30,12 @@ T = TypeVar("T")
 Disposition = Literal["allow", "deny", "needs_consent", "needs_inspection", "service_error"]
 
 
+def canonical_purpose(value: str) -> str:
+    if not isinstance(value, str) or len(value) > 8192 or "\x00" in value:
+        raise ValueError("invalid disclosure purpose")
+    return " ".join(value.split())
+
+
 @dataclass(frozen=True)
 class DisclosureScope:
     principal: str
@@ -42,6 +48,7 @@ class DisclosureScope:
     policy_version: str = POLICY_VERSION
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "purpose", canonical_purpose(self.purpose))
         for value in asdict(self).values():
             if not isinstance(value, str) or not value.strip() or len(value) > 8192 or any(c in value for c in "\r\n\x00"):
                 raise ValueError("disclosure scope fields must be bounded non-empty strings")

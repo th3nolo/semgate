@@ -204,8 +204,15 @@ def test_minimized_history_does_not_silently_disable_session_drift(tmp_path):
     ledger = Ledger(str(tmp_path / "private-ledger.jsonl"))
     ledger.record_judgment(env, Decision("allow", stage="semantic", envelope_digest="previous",
                                       predicate_votes=[{"predicate": "on_task", "p": 0.1}]), private=True)
+    # Minimized history retains a keyed identity for the original user turn,
+    # so its adverse vote remains part of the current drift window.
+    assert ledger.session_on_task(env) == [0.1]
+    rows = [json.loads(line) for line in ledger.path.read_text().splitlines()]
+    assert EMAIL not in json.dumps(rows)
+    rows[0].pop("privacy_turn_id")
+    ledger.path.write_text("\n".join(json.dumps(row) for row in rows)+"\n")
     with pytest.raises(IncompleteWindow, match="privacy-minimized"):
-        ledger.session_on_task(env)
+        ledger.session_on_task(env)  # Legacy redacted history still fails closed.
 
 
 def test_sensitive_session_id_cannot_make_drift_history_disappear(tmp_path):

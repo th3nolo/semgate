@@ -269,7 +269,7 @@ def test_data_consent_cannot_soften_permission_ask_or_deny(tmp_path):
     approve(sender, prepared)
     sender.gate.grant = replace(sender.gate.grant, allowed_domains=())
     result = sender.send(prepared)
-    assert result.outcome.disposition == "needs_consent" and result.delivery == "not_sent"
+    assert result.outcome.disposition == "needs_inspection" and result.delivery == "not_sent"
     assert not result.outcome.request_id  # this ask belongs to the ordinary permission layer
     sender.gate.grant = replace(sender.gate.grant, allowed_tools=("read",))
     assert sender.send(prepared).outcome.disposition == "deny"

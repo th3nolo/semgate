@@ -210,6 +210,16 @@ def session_kinds(cfg: Mapping[str, Any], *, session_id: str, messages: Sequence
 
 # -------------------------------------------------------------------- purpose
 
+def resolve(grant: UserGrant, cfg: Mapping[str, Any], *, session_id: str, messages: Sequence[str],
+            provider: Optional[JudgeProvider]):
+    """Resolve the same effective grant for preparation and permission checks."""
+    if cfg.get("enabled") is not True:
+        return grant, None, None
+    table = load_profiles(str(cfg.get("file") or "") or None)
+    kinds = session_kinds(cfg, session_id=session_id, messages=messages, provider=provider, table=table)
+    return apply(grant, kinds, table), kinds, table
+
+
 def compose_purpose(table: KindTable, kinds: SessionKinds) -> str:
     labels = [table.short(k) for k in kinds.active]
     authorized = "; ".join(str(table.kinds[k]["authorized"]).strip() for k in kinds.active)

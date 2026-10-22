@@ -564,7 +564,7 @@ def path_within(path: str, prefixes: Tuple[str, ...]) -> bool:
     return False
 
 
-def check_grant_scope(envelope: Envelope, *, trusted_send_client: bool = False) -> List[str]:
+def check_grant_scope(envelope: Envelope, *, trusted_send_client: bool = False, path_view: Any = None) -> List[str]:
     """Return a list of scope violations; empty list means in scope."""
     grant = envelope.grant
     violations: List[str] = []
@@ -602,7 +602,9 @@ def check_grant_scope(envelope: Envelope, *, trusted_send_client: bool = False) 
             if own.get(path, 0) > 0:
                 own[path] -= 1
                 continue
-            if not path_within(path, grant.allowed_path_prefixes):
+            within = (path_view.within(path, grant.allowed_path_prefixes, envelope.environment.cwd)
+                      if path_view is not None else path_within(path, grant.allowed_path_prefixes))
+            if not within:
                 violations.append(f"path '{path}' is outside the grant's allowed_path_prefixes")
 
     return violations
@@ -686,7 +688,7 @@ def semgate_state_code_write(command: str) -> str:
     return ""
 
 
-def check_hard_deny(envelope: Envelope, *, trusted_send_client: bool = False) -> RuleResult:
+def check_hard_deny(envelope: Envelope, *, trusted_send_client: bool = False, path_view: Any = None) -> RuleResult:
     text = _hard_text(envelope)
     for pattern in HARD_DENY_PATTERNS:
         match = pattern.search(text)
@@ -735,7 +737,7 @@ def check_hard_deny(envelope: Envelope, *, trusted_send_client: bool = False) ->
             if hit:
                 return RuleResult(outcome="deny", rule="trust_grant_scope",
                                   detail=f"semgate trust add of a command the grant forbids (pattern {hit!r}); it can never be trusted")
-    violations = check_grant_scope(envelope, trusted_send_client=trusted_send_client)
+    violations = check_grant_scope(envelope, trusted_send_client=trusted_send_client, path_view=path_view)
     if violations:
         return RuleResult(outcome="deny", rule="grant_scope", detail="; ".join(violations))
     return RuleResult(outcome="none")
@@ -1120,14 +1122,15 @@ def script_gate_hits(scripts: List["Any"], project_root: str = "", path_dirs: Se
     return hits
 
 
-def check_hard_allow(envelope: Envelope, allow_tools: Tuple[str, ...] = DEFAULT_HARD_ALLOW_TOOLS) -> RuleResult:
+def check_hard_allow(envelope: Envelope, allow_tools: Tuple[str, ...] = DEFAULT_HARD_ALLOW_TOOLS,
+                     *, path_view: Any = None) -> RuleResult:
     """Conservative deterministic allow: a read-only tool, in-scope, no gate.
     The read tool may also read an installed agent skill file outside the
     project (installed_skill_root): the host loads skills anyway, and
     semgate's own skill tells the agent how to act on semgate's answers."""
     if envelope.action.tool not in allow_tools:
         return RuleResult(outcome="none")
-    if check_grant_scope(envelope):
+    if check_grant_scope(envelope, path_view=path_view):
         return RuleResult(outcome="none")
     root = envelope.environment.project_root
     skills: List[str] = []

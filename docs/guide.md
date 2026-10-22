@@ -326,7 +326,10 @@ Privacy-enabled judgment records are minimized before entering the ledger.
 Other stores and host transcripts can still hold sensitive data; this is not
 comprehensive at-rest redaction. If minimized history cannot establish a
 session-drift window, the drift check abstains rather than silently dropping
-the earlier votes. Each check re-inspects referenced files and
+the earlier votes. New records use a keyed identity for the original user
+turn, so a normal follow-up starts a new window while same-turn votes remain
+available after minimization. Legacy redacted records without a comparable
+identity still require review. Each check re-inspects referenced files and
 records content hashes, but there is no atomic binding between a host's later
 file read and the inspected bytes. Use the prepared sender below when that
 binding is required. Post-tool exposure
@@ -404,7 +407,11 @@ snapshot without reopening a source file. The ordinary permission envelope
 contains effect metadata and a digest, not the body: command text inside a
 HookConf report stays data and does not execute or enter permission prompts.
 Underlying permission asks still require their own authorization; they carry
-no privacy request id when privacy consent is already satisfied.
+no privacy request id when privacy consent is already satisfied. In the
+prepared harness, an ordinary ask returns `needs_inspection` and its separate
+`approval_id`; the operator answers through `/v1/approve`. Preparing or
+previewing a snapshot preserves that one-time approval. Dispatch rechecks
+both gates and consumes the ordinary approval only on the dispatch path.
 Concurrent revocation and dispatch
 are serialized; revocation cannot cancel an already in-flight request. HTTPS
 is required except for explicit literal-loopback HTTP tests. The transport
