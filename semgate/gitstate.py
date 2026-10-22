@@ -152,7 +152,8 @@ class GitFacts:
 
     def _git(self, cwd: str, *args: str) -> Tuple[int, str]:
         try:
-            p = proc.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=self.timeout)
+            # Evidence reads must not invoke a repository-configured host helper.
+            p = proc.run(["git", "-c", "core.fsmonitor=false", *args], cwd=cwd, capture_output=True, text=True, timeout=self.timeout)
             return p.returncode, p.stdout
         except Exception:
             return 1, ""

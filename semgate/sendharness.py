@@ -161,7 +161,7 @@ class PreparedBroker:
         except (ValueError, UnicodeError):
             return {"disposition": "needs_inspection", "reason_code": "prepared_contract_mismatch", "delivery": "not_sent"}
         prepared = self.sender.prepare(body, destination=route["destination"], source=prepared.scope.source,
-                    categories=frozenset(route["categories"]), classification_complete=route["classification_complete"],
+                    categories=prepared.categories, classification_complete=prepared.classification_complete,
                     method=route["method"])
         with self.lock:
             self._prune()

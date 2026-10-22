@@ -215,3 +215,52 @@ def test_worker_view_keeps_feedback_bound_to_the_actual_host_project(tmp_path):
         decision = harness.check_development("echo fixture", project=str(root), task="prepared-harness-task", config=config,
                                              execution_facts=VerifiedOfflineFacts("0.12.0", "a"*64))
         assert decision.decision == expected, decision.reason_code
+
+
+def test_contracted_csv_retains_file_categories_in_operator_consent(tmp_path):
+    config, _ = configuration(tmp_path, "http://127.0.0.1:12345/report")
+    cfg = json.loads(config.read_text())
+    route = cfg["prepared_sends"]["routes"]["report"]
+    route["contract"] = {"format": "csv", "fields": {"name": {"enum": ["Synthetic Person"]}}, "max_rows": 8}
+    config.write_text(json.dumps(cfg))
+    (tmp_path/"report.csv").write_bytes(b"name\nSynthetic Person\n")
+    broker = PreparedBroker(str(config))
+    try:
+        pending = broker.prepare("report")
+        assert pending["disposition"] == "needs_consent"
+        view = broker.describe(pending["prepared_id"])
+        assert {"name", "technical_diagnostics"} <= set(view["categories"])
+        broker.consents.approve(pending["request_id"], auth=Auth("test"))
+        assert broker.prepare("report")["disposition"] == "allow"
+    finally:
+        broker.close()
+
+
+@pytest.mark.parametrize("encoded", [
+    "synthetic%40example%2etest",
+    "synthetic%2540example%252etest",
+    "synthetic%25%34%30example%25%32%65test",
+    "".join("%%%02x" % byte for byte in b"synthetic@example.test"),
+    "synthetic%40example%2Etest",
+    "%C3%A9synthetic%40example%2etest",
+    "%E2%C3%A9synthetic%40example%2etest",
+])
+def test_detected_percent_encoded_pii_is_removed_from_provider_inputs(encoded):
+    from urllib.parse import unquote
+    from semgate.providers.safe import SafeProvider
+    from test_privacy import CapturingProvider
+    provider = CapturingProvider()
+    prefix, suffix = "echo %20before ", " after%20literal"
+    SafeProvider(provider).evaluate({"message": prefix+encoded+suffix}, {"privacy": {"instructions": encoded}})
+    sent = provider.inputs[0]
+    assert sent["state"]["message"].startswith(prefix)
+    assert sent["state"]["message"].endswith(suffix)
+    for part in (sent["state"]["message"], sent["questions"]["privacy"]["instructions"]):
+        assert "synthetic@example.test" not in unquote(unquote(part))
+        assert "<PRIVATE_" in part
+
+
+def test_known_structured_value_is_removed_from_mixed_encoded_references():
+    from semgate.privacydata import safe_inputs
+    state, _ = safe_inputs({"reference": "Synthetic%20Person", "record": {"name": "Synthetic Person"}}, {})
+    assert state["reference"] == state["record"]["name"]

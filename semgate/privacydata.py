@@ -6,17 +6,18 @@ Raw findings and the placeholder map live only for one decision.
 """
 from __future__ import annotations
 
+import codecs
 import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping
-from urllib.parse import quote, unquote
 
 from . import secretfinder
 
 MAX_TEXT = 262144
 MAX_NODES = 8192
 MAX_DEPTH = 20
+_PERCENT_BYTES = re.compile(r"(?:%[0-9a-fA-F]{2})+")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
 _SSN = re.compile(r"(?<!\d)(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?!\d)")
 _PHONE = re.compile(r"(?<![\w\d])\+\d[\d ().-]{7,22}\d(?!\d)")
@@ -93,6 +94,39 @@ def find(text: str) -> List[Finding]:
     return sorted(unique.values(), key=lambda hit: (hit.start, -len(hit.value), hit.category))
 
 
+def _decoded_view(text: str, spans: list[tuple[int, int]]) -> tuple[str, list[tuple[int, int]]]:
+    """URL-decode once while retaining each character's original input span.
+
+    UTF-8 replacement characters can cover several bytes. Assign all emitted
+    characters that span so removing a finding also removes its encoded bytes.
+    """
+    pieces, positions = [], []
+    cursor = 0
+    for match in _PERCENT_BYTES.finditer(text):
+        pieces.append(text[cursor:match.start()])
+        positions.extend(spans[cursor:match.start()])
+        data = bytes.fromhex(match.group().replace("%", ""))
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        pending = 0
+        for index, byte in enumerate(data):
+            emitted = decoder.decode(bytes((byte,)))
+            end = index + 1 - len(decoder.getstate()[0])
+            if emitted:
+                source = (spans[match.start() + pending * 3][0], spans[match.start() + end * 3 - 1][1])
+                pieces.append(emitted)
+                positions.extend([source] * len(emitted))
+                pending = end
+        emitted = decoder.decode(b"", final=True)
+        if emitted:
+            source = (spans[match.start() + pending * 3][0], spans[match.end() - 1][1])
+            pieces.append(emitted)
+            positions.extend([source] * len(emitted))
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    positions.extend(spans[cursor:])
+    return "".join(pieces), positions
+
+
 class Minimizer:
     """One stable placeholder per value across state, task and questions."""
 
@@ -112,20 +146,45 @@ class Minimizer:
         return self.values[value]
 
     def text(self, value: str) -> str:
-        hits = find(value)
-        decoded = unquote(unquote(value))
-        if decoded != value:
-            hits.extend(find(decoded))
-        for hit in hits:
-            if hit.value not in self.values.values():
-                self.remember(hit.category, hit.value)
-        for match in _HOME.finditer(value):
-            self.remember("home", match.group())
-        out = value
-        for raw in sorted(self.values, key=len, reverse=True):
-            for variant in (raw, quote(raw, safe=""), quote(quote(raw, safe=""), safe="")):
-                out = out.replace(variant, self.values[raw])
-        return out
+        if len(value) > MAX_TEXT:
+            raise InputUnsafe("privacy text limit exceeded")
+        views = [(value, None)]
+        decoded, spans = value, None
+        for _ in range(2):
+            if not _PERCENT_BYTES.search(decoded):
+                break
+            if spans is None:
+                spans = [(i, i + 1) for i in range(len(value))]
+            decoded, spans = _decoded_view(decoded, spans)
+            views.append((decoded, spans))
+        for text, _ in views:
+            for hit in find(text):
+                if hit.value not in self.values.values():
+                    self.remember(hit.category, hit.value)
+            for match in _HOME.finditer(text):
+                self.remember("home", match.group())
+        intervals = []
+        for text, positions in views:
+            for raw in sorted(self.values, key=len, reverse=True):
+                start = text.find(raw)
+                while start >= 0:
+                    end = start + len(raw)
+                    left, right = (positions[start][0], positions[end - 1][1]) if positions is not None else (start, end)
+                    intervals.append((left, right, self.values[raw]))
+                    start = text.find(raw, end)
+        merged = []
+        for start, end, placeholder in sorted(intervals, key=lambda item: (item[0], -item[1])):
+            if merged and start < merged[-1][1]:
+                left, right, replacement = merged[-1]
+                merged[-1] = (left, max(right, end), replacement)
+            else:
+                merged.append((start, end, placeholder))
+        pieces, cursor = [], 0
+        for start, end, placeholder in merged:
+            pieces.extend((value[cursor:start], placeholder))
+            cursor = end
+        pieces.append(value[cursor:])
+        return "".join(pieces)
 
     def clean(self, value: Any, *, key: str = "", depth: int = 0) -> Any:
         self.nodes += 1
