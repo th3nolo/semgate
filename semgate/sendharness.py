@@ -107,6 +107,20 @@ class PreparedBroker:
             path = Path(settings[key]).expanduser().resolve()
             if ".semgate" not in {p.name.lower() for p in path.parents}:
                 raise ValueError("prepared state must be under the protected .semgate tree")
+        from .storepaths import operator_paths
+        self.protected_paths = tuple(dict.fromkeys((self.config_path, self.config["grant_file"], self.config["policy_file"],
+            settings["client_file"], settings["consent_store"], *(path for _, path in operator_paths(self.config)))))
+        if "development" in settings:
+            project = Path(settings["project_root"]).resolve()
+            for name in self.protected_paths:
+                lexical = Path(name).expanduser().absolute()
+                # Both the configured alias and its target must be protected;
+                # an agent-writable alias must not redirect an authority read.
+                for path in (lexical, lexical.resolve()):
+                    if path.is_relative_to(project):
+                        parts = path.relative_to(project).parts
+                        if not parts or parts[0] not in {".semgate", ".codex", ".agents", ".git"}:
+                            raise ValueError("operator state must be outside the project or in its protected metadata trees")
         self.consents = ConsentStore(Path(settings["consent_store"]))
         self.signature = self._signature()
         self.sender = PreparedSender(_HarnessGate(self), self.consents, task_id=settings["task_id"],
@@ -119,12 +133,6 @@ class PreparedBroker:
         self.development_slot = threading.BoundedSemaphore(1)
         if "development" in settings:
             from .devworker import OfflineWorker
-            project = Path(settings["project_root"]).resolve()
-            for name in (self.config_path, self.config["grant_file"], self.config["policy_file"],
-                         settings["client_file"], settings["consent_store"]):
-                path = Path(name).resolve()
-                if path.is_relative_to(project) and path.relative_to(project).parts[0] not in {".semgate", ".codex", ".agents", ".git"}:
-                    raise ValueError("operator state must be outside the project or in its protected metadata trees")
             self.development = OfflineWorker(settings["development"])
 
     def _signature(self) -> str:
@@ -167,7 +175,7 @@ class PreparedBroker:
             return {"disposition": "needs_inspection", "reason_code": "prepared_contract_mismatch", "delivery": "not_sent"}
         prepared = self.sender.prepare(body, destination=route["destination"], source=prepared.scope.source,
                     categories=prepared.categories, classification_complete=prepared.classification_complete,
-                    method=route["method"])
+                    method=route["method"], content_format=route["contract"]["format"])
         with self.lock:
             self._prune()
             if len(self.items) + len(self.busy) + len(self.completed) >= self.maximum:
@@ -230,8 +238,7 @@ class PreparedBroker:
             return {"disposition": "service_error", "reason_code": "development_busy", "delivery": "not_sent"}
         try:
             from .devworker import WriteConfinementError
-            protected = (self.config_path, self.config["grant_file"], self.config["policy_file"],
-                         self.settings["client_file"], self.settings["consent_store"])
+            protected = self.protected_paths
             try:
                 facts = self.development.verify(self.settings["project_root"], protected=protected)
                 if command is not None:

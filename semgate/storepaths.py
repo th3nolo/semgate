@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -182,6 +183,27 @@ def store_paths(config: Mapping[str, Any], host: str = "") -> List[Tuple[str, st
     if trust.enabled(config):
         out.append(("trust", str(trust.store_path(config))))
     return out
+
+
+def operator_paths(config: Mapping[str, Any]) -> List[Tuple[str, str]]:
+    """Authority stores and their derived sidecars, without opening them."""
+    from . import approvals, chatapproval, trust, trustauth
+    out = store_paths(config)
+    tr = trust.store_path(config)
+    out.extend((("ordinary_approvals", str(approvals.store_path(config))),
+                ("chat_approvals", str(chatapproval.store_dir(config))),
+                ("trust", str(tr)), ("trust_key", str(tr.with_name(trust.KEY_NAME))),
+                ("agent_hosts", str(tr.with_name(trustauth.HOSTS_NAME))),
+                ("trust_tickets", str(tr.with_name(trustauth.TICKETS_NAME))),
+                ("ledger_key", str(Path(ledger_file(config)).with_name(trust.KEY_NAME)))))
+    profile = config.get("profiles")
+    if isinstance(profile, Mapping) and profile.get("enabled") is True and profile.get("file"):
+        out.append(("profile_definitions", str(profile["file"])))
+    prepared = config.get("prepared_sends")
+    if isinstance(prepared, Mapping) and prepared.get("consent_store"):
+        consent = Path(str(prepared["consent_store"]))
+        out.append(("consent_key", str(consent.with_name(trust.KEY_NAME))))
+    return list(dict.fromkeys(out))
 
 
 def deny_streak_file(config: Mapping[str, Any]) -> str:

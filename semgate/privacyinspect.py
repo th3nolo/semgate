@@ -71,7 +71,32 @@ def _references(value: Any, key: str = "", depth: int = 0) -> List[str]:
     return []
 
 
-def inspect(envelope: Envelope) -> Inspection:
+def inspect_content(cleaner: Minimizer, content: str, content_format: str = "") -> None:
+    """Inspect the same bounded structured values for files and saved bytes."""
+    cleaner.text(content)
+    if content_format == "jsonl":
+        for line in content.splitlines():
+            if line.strip():
+                cleaner.clean(json.loads(line))
+    elif content_format in ("csv", "tsv"):
+        import csv
+        import io
+        try:
+            for row in csv.DictReader(io.StringIO(content), delimiter="\t" if content_format == "tsv" else ",", strict=True):
+                cleaner.clean(row)
+        except csv.Error as exc:
+            raise InputUnsafe("uninspectable delimited content") from exc
+    elif content_format == "json":
+        cleaner.clean(json.loads(content))
+    else:
+        try:
+            value = json.loads(content)
+        except ValueError:
+            return
+        cleaner.clean(value)
+
+
+def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
     result = Inspection()
     args = dict(envelope.action.arguments)
     text = json.dumps(args, ensure_ascii=False, default=str)
@@ -113,15 +138,16 @@ def inspect(envelope: Envelope) -> Inspection:
         result.problem("indirect_payload")
     if re.search(r"(?i)\b(?:scp|sftp|rsync|ssh|git\s+push)\b", command):
         result.problem("unsupported_transport")
-    references = _references(args)
+    references = _references(args) if follow_files else []
     from .privacycommands import file_references
     command_files = file_references(command)
-    references.extend(command_files.references)
+    if follow_files:
+        references.extend(command_files.references)
     for problem in command_files.problems:
         result.problem(problem)
     # Non-curl tools retain conservative @file discovery. Curl has its own
     # grammar (an email or --form-string @value is not a file read).
-    if not re.search(r"(?i)\bcurl(?:\.exe)?\b", command):
+    if follow_files and not re.search(r"(?i)\bcurl(?:\.exe)?\b", command):
         references.extend(next(g for g in m.groups() if g is not None) for m in _AT_FILE.finditer(command))
     references = list(dict.fromkeys(references))
     if len(references) > MAX_FILES:
@@ -167,18 +193,11 @@ def inspect(envelope: Envelope) -> Inspection:
             if "\x00" in content:
                 result.problem("binary_file")
                 continue
-            result.cleaner.text(content)
-            if path.suffix.lower() == ".json":
-                result.cleaner.clean(json.loads(content))
-            elif path.suffix.lower() in (".csv", ".tsv"):
-                import csv
-                import io
-                for row in csv.DictReader(io.StringIO(content), delimiter="\t" if path.suffix.lower() == ".tsv" else ","):
-                    result.cleaner.clean(row)
+            inspect_content(result.cleaner, content, path.suffix.lower().lstrip("."))
             digest = hashlib.sha256(data).hexdigest()
             result.files.append({"source": f"file_{index + 1}", "bytes": len(data), "sha256": digest})
             result.snapshots[path] = digest
             result.payloads[path] = data
-        except (OSError, ValueError, InputUnsafe, UnicodeError):
+        except (OSError, ValueError, InputUnsafe, UnicodeError, RecursionError):
             result.problem("file_uninspectable")
     return result

@@ -354,6 +354,10 @@ def _cmd_feedback(args) -> int:
         if pick["stage"] == "hard_rules" and pick["decision"] == "deny":
             print(f"not recorded: `{args.command}` is hard-denied (a fixed rule); an approval cannot override it.", file=sys.stderr)
             return 2
+        if pick["stage"] == "privacy":
+            print("not recorded: this step needs separate privacy inspection or consent; ordinary feedback cannot grant it.",
+                  file=sys.stderr)
+            return 2
         config = src.config
         ttl = args.ttl_hours if args.ttl_hours is not None else ttl_hours_from(config)
         fb = FeedbackStore(src.store, max_ttl_hours=max(ttl or 0, ttl_hours_from(config)))

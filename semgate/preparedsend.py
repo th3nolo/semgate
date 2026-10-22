@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import ipaddress
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Protocol
 from urllib.error import HTTPError
@@ -18,7 +17,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from .privacyconsent import ConsentOutcome, DisclosureScope, POLICY_VERSION, canonical_purpose, validate_categories
 from .privacydata import MAX_TEXT
-from .privacyinspect import Inspection, inspect
+from .privacyinspect import Inspection, inspect, inspect_content
 
 if TYPE_CHECKING:
     from .envelope import Envelope
@@ -53,6 +52,7 @@ class PreparedSend:
     body: bytes
     categories: frozenset[str]
     classification_complete: bool = False
+    content_format: str = ""
 
     def __post_init__(self) -> None:
         if type(self.body) is not bytes or len(self.body) > MAX_TEXT:
@@ -61,6 +61,8 @@ class PreparedSend:
         validate_categories(self.categories)
         if not isinstance(self.classification_complete, bool) or self.scope.operation not in {"POST", "PUT"}:
             raise ValueError("invalid prepared disclosure")
+        if self.content_format not in {"", "text", "json", "jsonl", "csv", "tsv"}:
+            raise ValueError("invalid prepared content format")
 
     @property
     def digest(self) -> str:
@@ -75,12 +77,13 @@ class PreparedSend:
         from dataclasses import replace
         from .envelope import ProposedAction
         text = self.body.decode("utf-8-sig")
+        action = ProposedAction("http_request", {**self.arguments(), "body": text})
+        result = inspect(replace(envelope, action=action), follow_files=False)
         try:
-            body = json.loads(text)
-        except ValueError:
-            body = text
-        action = ProposedAction("http_request", {**self.arguments(), "body": body})
-        return inspect(replace(envelope, action=action))
+            inspect_content(result.cleaner, text, self.content_format)
+        except (ValueError, UnicodeError, RecursionError):
+            result.problem("payload_uninspectable")
+        return result
 
     def matches(self, envelope: Envelope) -> bool:
         from .feedback import norm_root
@@ -144,16 +147,16 @@ class PreparedSender:
         self.transport = transport or HTTPTransport()
 
     def prepare(self, body: bytes, *, destination: str, source: str, categories: frozenset[str],
-                classification_complete: bool = False, method: str = "POST") -> PreparedSend:
+                classification_complete: bool = False, method: str = "POST", content_format: str = "") -> PreparedSend:
         """Host-side classification assertion; never copy it from agent/tool arguments."""
         url = canonical_destination(destination, allow_loopback_http=self.allow_loopback_http)
         scope = DisclosureScope(self.gate.grant.principal, self.gate.project_root, self.task_id, source, method,
                                 url, self.gate.grant.purpose, POLICY_VERSION + ":" + self.gate.policy.version)
-        prepared = PreparedSend(scope, body, categories, classification_complete)
+        prepared = PreparedSend(scope, body, categories, classification_complete, content_format)
         # Local signals always add categories, even if the host omitted them.
         evidence = prepared.inspect(self.gate.envelope("", tool="http_request", arguments=prepared.arguments()))
         found = frozenset(c for c in evidence.cleaner.counts if c != "home")
-        return PreparedSend(scope, body, categories | found, classification_complete and evidence.complete)
+        return PreparedSend(scope, body, categories | found, classification_complete and evidence.complete, content_format)
 
     def prepare_file(self, path: Path, *, destination: str, categories: frozenset[str],
                      classification_complete: bool = False, method: str = "POST") -> PreparedSend:
@@ -164,7 +167,8 @@ class PreparedSender:
         resolved, body = next(iter(evidence.payloads.items()))
         found = frozenset(c for c in evidence.cleaner.counts if c != "home")
         return self.prepare(body, destination=destination, source=str(resolved), categories=categories | found,
-                            classification_complete=classification_complete, method=method)
+                            classification_complete=classification_complete, method=method,
+                            content_format=resolved.suffix.lower().lstrip(".") if resolved.suffix.lower() in {".json", ".jsonl", ".csv", ".tsv"} else "text")
 
     def check(self, prepared: PreparedSend) -> Decision:
         if (prepared.scope.task != self.task_id

@@ -27,6 +27,13 @@ from . import filelock
 from .envelope import Envelope, utcnow_iso
 
 
+def private_identity(key: bytes, field: str, value: str) -> str:
+    """Exact, domain-separated identity without storing a guessable digest."""
+    import json
+    from .fingerprints import fingerprint
+    return fingerprint(key, "privacy-ledger-" + field + "/1\x00" + json.dumps(value, ensure_ascii=True))
+
+
 class IncompleteWindow(RuntimeError):
     """The session-drift reader could not read every earlier judgment of the
     window (lock timeout, unreadable file, a malformed line that may belong
@@ -73,11 +80,23 @@ class Ledger:
             from .privacydata import safe_inputs
             try:
                 private_turn = self._private_turn_id(record["envelope"])
+                from .feedback import _command_of, norm_root
+                from .trustauth import key_for_store
+                key = key_for_store(self.path)
+                identities = {"privacy_" + field + "_id": private_identity(key, field, value)
+                              for field, value in (
+                                  ("command", _command_of(envelope.action.arguments)),
+                                  ("tool", envelope.action.tool),
+                                  ("session", envelope.environment.session_id),
+                                  ("project", norm_root(envelope.environment.project_root or envelope.environment.cwd)))}
                 record, _ = safe_inputs(record, {})
+                record.update(identities)
                 record["privacy_minimized"] = True
                 record["privacy_turn_id"] = private_turn
                 if record["envelope"]["environment"].get("session_id") != envelope.environment.session_id:
                     record["privacy_session_unattributed"] = True
+                if record["envelope"]["action"].get("tool") != envelope.action.tool:
+                    record["privacy_tool_unattributed"] = True
             except Exception:
                 # Inspection overflow must never fall back to writing the raw
                 # envelope or exception message. Missing history stays unknown.
