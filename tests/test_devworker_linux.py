@@ -266,8 +266,9 @@ print('PROJECT_AND_SOURCE_READ_ONLY')
         self.assertTrue(cache.is_symlink());self.assertEqual((target/"keep").read_text(),"keep")
         cache.unlink();cache.mkdir();(cache/"keep").write_text("cache data")
         recovery=self.root/".semgate/cache-recovery"
-        # The first attempt created an empty real store, remove only that empty directory.
-        recovery.rmdir();recovery.symlink_to(target,target_is_directory=True)
+        # A refused cache target need not create recovery metadata.
+        if recovery.exists(): recovery.rmdir()
+        recovery.symlink_to(target,target_is_directory=True)
         self.assertNotEqual(self.cleanup_cache()["exit_code"],0)
         self.assertEqual((cache/"keep").read_text(),"cache data")
         self.assertEqual(sorted(p.name for p in target.iterdir()),["keep"])

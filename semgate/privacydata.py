@@ -7,6 +7,7 @@ Raw findings and the placeholder map live only for one decision.
 from __future__ import annotations
 
 import codecs
+from copy import deepcopy
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -205,18 +206,30 @@ class Minimizer:
             self.text(raw)
             return placeholder
         if isinstance(value, str):
+            if len(value) > MAX_TEXT:
+                raise InputUnsafe("privacy text limit exceeded")
+            # Preserve the assignment context used by the existing detector;
+            # a generic credential need not have a vendor-specific prefix.
+            if (secretfinder.quoted_name(key) and (secretfinder.quoted_value(value)
+                    or secretfinder.secret_name(key) and secretfinder.secret_value(value, key, True))):
+                self.remember("secret", value)
             return self.text(value)
         if isinstance(value, Mapping):
             return {self.text(str(k)): self.clean(v, key=str(k), depth=depth + 1) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self.clean(v, key=key, depth=depth + 1) for v in value]
-        if value is None or isinstance(value, (bool, int, float)):
+        if value is None or isinstance(value, bool):
             return value
+        if isinstance(value, (int, float)):
+            raw = str(value)
+            minimized = self.text(raw)
+            return value if minimized == raw else minimized
         raise InputUnsafe("unsupported privacy input type")
 
 
-def safe_inputs(state: Mapping[str, Any], questions: Mapping[str, Any]) -> tuple:
-    cleaner = Minimizer()
+def safe_inputs(state: Mapping[str, Any], questions: Mapping[str, Any], *, seed: Minimizer | None = None) -> tuple:
+    cleaner = deepcopy(seed) if seed is not None else Minimizer()
+    cleaner.nodes = 0
     # First collect values throughout the object, then replace them everywhere
     # (including earlier fields that reference a later structured PII field).
     cleaner.clean(state)

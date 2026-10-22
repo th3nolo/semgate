@@ -28,16 +28,21 @@ class _HarnessGate(Gate):
     def __init__(self, broker: PreparedBroker) -> None:
         cfg = broker.config
         grant = UserGrant.from_dict(json.loads(Path(cfg["grant_file"]).read_text(encoding="utf-8")))
-        profiles = cfg.get("profiles")
-        if isinstance(profiles, dict) and profiles.get("enabled") is True:
-            from .antigravity_hook import configured_provider
-            from .profiles import resolve
-            grant, _, _ = resolve(grant, profiles, session_id=broker.settings["task_id"],
-                                  messages=[broker.task_request()], provider=configured_provider(cfg))
         super().__init__(grant.purpose, grant=grant, policy=cfg["policy_file"], provider="none",
                          project_root=broker.settings["project_root"], session_id=broker.settings["task_id"],
                          privacy_gate=PrivacyGate(consents=broker.consents, require_prepared=True))
         self.broker = broker
+        profiles = cfg.get("profiles")
+        if isinstance(profiles, dict) and profiles.get("enabled") is True:
+            from .antigravity_hook import configured_provider
+            from .profiles import resolve
+            from .providers.safe import for_envelope
+            context = self.envelope("", tool="http_request", arguments={
+                "files": [route["source_file"] for route in broker.settings["routes"].values()]})
+            provider = for_envelope(configured_provider(cfg), context)
+            grant, _, _ = resolve(grant, profiles, session_id=broker.settings["task_id"],
+                                  messages=[broker.task_request()], provider=provider)
+            self.grant = grant
 
     def check_prepared(self, prepared: PreparedSend, *, consume_approval: bool = True):
         self.broker.ensure_current()

@@ -33,15 +33,17 @@ flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
 root=os.open('/workspace',flags)
 state=store=entry=None
 try:
- state=os.open('.semgate',flags,dir_fd=root)
- try: os.mkdir('cache-recovery',0o700,dir_fd=state)
- except FileExistsError: pass
- store=os.open('cache-recovery',flags,dir_fd=state)
  try: source=os.stat('__pycache__',dir_fd=root,follow_symlinks=False)
  except FileNotFoundError:
   print(json.dumps({'cache_cleanup':{'path':'__pycache__','state':'absent'}}))
  else:
   if not stat.S_ISDIR(source.st_mode): raise ValueError('cache target must be a real directory')
+  try: os.mkdir('.semgate',0o700,dir_fd=root)
+  except FileExistsError: pass
+  state=os.open('.semgate',flags,dir_fd=root)
+  try: os.mkdir('cache-recovery',0o700,dir_fd=state)
+  except FileExistsError: pass
+  store=os.open('cache-recovery',flags,dir_fd=state)
   ident=secrets.token_hex(16)
   os.mkdir(ident,0o700,dir_fd=store)
   entry=os.open(ident,flags,dir_fd=store)

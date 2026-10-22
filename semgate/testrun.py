@@ -1141,7 +1141,7 @@ def _ini_section(text: str, section: str) -> Optional[str]:
     return rest[: end.start()] if end else rest
 
 
-def _local_python_imports(ctx: _Ctx, file: ScriptFile, cwd: str) -> List[str]:
+def _local_python_imports(ctx: _Ctx, file: ScriptFile, roots: Sequence[str]) -> List[str]:
     """Conservative local import candidates, read as data without importing.
 
     Includes package initializers and possible from-import submodules. This
@@ -1151,7 +1151,7 @@ def _local_python_imports(ctx: _Ctx, file: ScriptFile, cwd: str) -> List[str]:
     found = set()
     for node in ast.walk(tree):
         names = []
-        base = cwd
+        bases = list(roots)
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
@@ -1159,6 +1159,7 @@ def _local_python_imports(ctx: _Ctx, file: ScriptFile, cwd: str) -> List[str]:
                 base = _dirname(file.path)
                 for _ in range(node.level - 1):
                     base = _dirname(base)
+                bases = [base]
             module = node.module or ""
             names = ([module] if module else []) + [
                 ".".join(p for p in (module, alias.name) if p)
@@ -1167,25 +1168,40 @@ def _local_python_imports(ctx: _Ctx, file: ScriptFile, cwd: str) -> List[str]:
             parts = name.split(".")
             if not all(p.isidentifier() for p in parts):
                 continue
-            for i in range(1, len(parts) + 1):
-                package = _join(base, "/".join(parts[:i]) + "/__init__.py")
-                if _entry(ctx.ws, package, ctx.root) == "file":
-                    found.add(package)
-            module_path = _join(base, "/".join(parts) + ".py")
-            if _entry(ctx.ws, module_path, ctx.root) == "file":
-                found.add(module_path)
+            for base in bases:
+                for i in range(1, len(parts) + 1):
+                    package = _join(base, "/".join(parts[:i]) + "/__init__.py")
+                    if _entry(ctx.ws, package, ctx.root) == "file":
+                        found.add(package)
+                module_path = _join(base, "/".join(parts) + ".py")
+                if _entry(ctx.ws, module_path, ctx.root) == "file":
+                    found.add(module_path)
     return sorted(found)
 
 
-def _test_sources(ctx: _Ctx, paths: List[str], cwd: str, complete: bool) -> str:
+def _test_sources(ctx: _Ctx, paths: List[str], cwd: str, complete: bool,
+                  import_roots: Optional[Sequence[str]] = None) -> str:
     """Bounded test inputs and local imports; never a closed call graph."""
     if not ctx.read_test_sources:
         return " Their content was not read."
     if not complete or len(paths) > MAX_TEST_SOURCES:
         ctx.skip("unittest sources", "incomplete listing or too many direct test inputs", incomplete=True)
         return " Test-source inspection is incomplete."
+    roots = tuple(dict.fromkeys(import_roots or (cwd,)))
     total, seen = 0, set()
-    pending = sorted(set(paths))
+    inputs = set(paths)
+    # Importing pkg.test imports each ancestor package before the test module.
+    for path in paths:
+        folder = _dirname(path)
+        while folder != roots[0] and inside(folder, roots[0], allow_equal=True):
+            initializer = _join(folder, "__init__.py")
+            if _entry(ctx.ws, initializer, ctx.root) == "file":
+                inputs.add(initializer)
+            parent = _dirname(folder)
+            if parent == folder:
+                break
+            folder = parent
+    pending = sorted(inputs)
     while pending:
         path = pending.pop(0)
         if path in seen:
@@ -1204,7 +1220,7 @@ def _test_sources(ctx: _Ctx, paths: List[str], cwd: str, complete: bool) -> str:
             break
         ctx.add_file(file, cwd)
         try:
-            pending.extend(p for p in _local_python_imports(ctx, file, cwd) if p not in seen)
+            pending.extend(p for p in _local_python_imports(ctx, file, roots) if p not in seen)
         except (SyntaxError, ValueError, RecursionError):
             ctx.skip(file.rel, "Python imports could not be inspected", incomplete=True)
     return (" Test sources and statically named local imports are shown below. "
@@ -1225,7 +1241,8 @@ def _unittest(ctx: _Ctx, args: List[str], cwd: str, label: str) -> None:
         if not args[i].startswith("-"):
             positional.append(args[i])
         i += 1
-    start, pattern, discover = ".", "test*.py", not positional or positional[0] == "discover"
+    start, pattern, top = ".", "test*.py", None
+    discover = not positional or positional[0] == "discover"
     if discover:
         rest = args[args.index("discover") + 1:] if "discover" in args else list(args)
         pos: List[str] = []
@@ -1241,7 +1258,27 @@ def _unittest(ctx: _Ctx, args: List[str], cwd: str, label: str) -> None:
                 i += 2
                 continue
             if a in ("-t", "--top-level-directory", "-k") and i + 1 < len(rest):
+                if a != "-k":
+                    top = rest[i + 1]
                 i += 2
+                continue
+            attached = False
+            for short, long, setting in (("-s", "--start-directory", "start"),
+                                         ("-p", "--pattern", "pattern"),
+                                         ("-t", "--top-level-directory", "top")):
+                value = a.split("=", 1)[1] if a.startswith(long + "=") else (
+                    a[len(short):].removeprefix("=") if a.startswith(short) and len(a) > len(short) else None)
+                if value is not None:
+                    if setting == "start":
+                        start = value
+                    elif setting == "pattern":
+                        pattern = value
+                    else:
+                        top = value
+                    attached = True
+                    break
+            if attached:
+                i += 1
                 continue
             if not a.startswith("-"):
                 pos.append(a)
@@ -1250,11 +1287,18 @@ def _unittest(ctx: _Ctx, args: List[str], cwd: str, label: str) -> None:
             start = pos[0]
         if len(pos) > 1:
             pattern = pos[1]
+        if len(pos) > 2:
+            top = pos[2]
     head = f"checked by code: {label} runs unittest, the Python standard test runner, in {_where(cwd, ctx.root)}."
     if discover:
         folder = _join(cwd, start)
+        top_root = _join(cwd, top) if top is not None else folder
         if not inside(folder, ctx.root, allow_equal=True):
             ctx.ev.facts.append(head + f" It collects tests from {start}, outside the project folder {ctx.root}.")
+            return
+        if not inside(top_root, ctx.root, allow_equal=True) or not inside(folder, top_root, allow_equal=True):
+            ctx.skip("unittest sources", "discovery import root is outside the permitted project", incomplete=True)
+            ctx.ev.facts.append(head + " Test-source inspection is incomplete.")
             return
         if ctx.ws is None:
             ctx.ev.facts.append(head + f" It collects test files named {pattern} from {start}, inside the project "
@@ -1267,7 +1311,8 @@ def _unittest(ctx: _Ctx, args: List[str], cwd: str, label: str) -> None:
         # when their initializer does not match the test filename pattern.
         initializers = [p for p in files if _mod(p).basename(p) == "__init__.py"]
         ctx.ev.facts.append(head + f" It runs the project's own test files inside the project folder: "
-                                   f"{_names(picked, cwd, complete)}." + _test_sources(ctx, picked + initializers, cwd, complete))
+                                   f"{_names(picked, cwd, complete)}." + _test_sources(
+                                       ctx, picked + initializers, cwd, complete, (top_root, cwd)))
         return
     mods = [a for a in positional]
     paths = []
@@ -1276,7 +1321,22 @@ def _unittest(ctx: _Ctx, args: List[str], cwd: str, label: str) -> None:
             paths.append(m)
         else:
             parts = m.split(".")
-            paths.append("/".join(parts[:-1] if len(parts) > 1 and parts[-1][:1].isupper() else parts) + ".py")
+            selected = None
+            if ctx.ws is not None:
+                if len(parts) > MAX_TEST_SOURCES:
+                    ctx.skip("unittest sources", "module selector exceeds the local source bound", incomplete=True)
+                else:
+                    # A selector may end in TestCase/method attributes. Resolve
+                    # its longest local module prefix, as unittest imports it.
+                    for count in range(len(parts), 0, -1):
+                        base = "/".join(parts[:count])
+                        for candidate in (base + "/__init__.py", base + ".py"):
+                            if _entry(ctx.ws, _join(cwd, candidate), ctx.root) == "file":
+                                selected = candidate
+                                break
+                        if selected is not None:
+                            break
+            paths.append(selected or "/".join(parts) + ".py")
     if ctx.ws is None:
         ctx.ev.facts.append(head + f" It runs the test modules {', '.join(mods)[:200]}. The test files were not read.")
         return

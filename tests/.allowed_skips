@@ -31,6 +31,7 @@ windows: ^symlinks not available$
 windows: ^cannot create a link here: \[WinError 1314\] A required privilege is not held by the client
 # POSIX-only behaviour tested on Linux/macOS.
 windows: ^POSIX file mode$
+windows: ^POSIX directory descriptors$
 windows: ^needs bash and curl \(the script is run on Linux/macOS\)$
 # The SWE row cache (evals/data/, gitignored) exists only in the main checkout.
 any: ^SWE row cache absent \(git-ignored, MAIN repo only\)$

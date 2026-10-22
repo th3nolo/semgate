@@ -511,6 +511,10 @@ def _run_core(
     privacy_gate = privacy_from_config(config)
     if privacy_gate is not None and prepared_disclosure is not None:
         privacy_gate.consents = consent_store
+    if privacy_gate is not None:
+        from .providers.safe import for_envelope
+        provider = for_envelope(provider, build_envelope(grant), prepared=prepared_disclosure,
+                                offline_shell=trusted_offline_shell)
     # Work kinds: the purpose Jev judges against is composed from every kind of
     # work the user has asked for this session (see profiles.py). The grant's
     # hard scope (forbidden patterns, expiry) is untouched; kinds may only add
