@@ -209,7 +209,12 @@ def main(argv=None) -> int:
         print(json.dumps(result))
         return 2
     print(json.dumps(result, sort_keys=True))
-    return result.get("exit_code", 0) if args.action == "run" else 0
+    if args.action == "run":
+        code = result.get("exit_code")
+        if result.get("disposition") != "allow" or result.get("timed_out") or type(code) is not int:
+            return 2
+        return code
+    return 0
 
 
 if __name__ == "__main__":

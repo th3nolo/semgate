@@ -82,7 +82,10 @@ def inspect_content(cleaner: Minimizer, content: str, content_format: str = "") 
         import csv
         import io
         try:
-            for row in csv.DictReader(io.StringIO(content), delimiter="\t" if content_format == "tsv" else ",", strict=True):
+            reader = csv.DictReader(io.StringIO(content), delimiter="\t" if content_format == "tsv" else ",", strict=True)
+            if reader.fieldnames and len(set(reader.fieldnames)) != len(reader.fieldnames):
+                raise InputUnsafe("duplicate delimited headers cannot be completely inspected")
+            for row in reader:
                 cleaner.clean(row)
         except csv.Error as exc:
             raise InputUnsafe("uninspectable delimited content") from exc

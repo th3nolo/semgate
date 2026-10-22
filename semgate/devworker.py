@@ -202,15 +202,18 @@ try:
   os.close(directory)
   directory=child
  name=path.split('/')[-1]
+ mode=0o600
  try:
   existing=os.stat(name,dir_fd=directory,follow_symlinks=False)
   if not stat.S_ISREG(existing.st_mode): raise ValueError('non-regular target')
+  mode=stat.S_IMODE(existing.st_mode)&0o777
  except FileNotFoundError: pass
  temporary='.semgate-write-'+secrets.token_hex(16)
  fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
  with os.fdopen(fd,'wb') as stream:
   stream.write(data)
   stream.flush()
+  os.fchmod(stream.fileno(),mode)
   os.fsync(stream.fileno())
  os.replace(temporary,name,src_dir_fd=directory,dst_dir_fd=directory)
  temporary=None

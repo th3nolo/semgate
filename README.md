@@ -18,6 +18,9 @@ still depend on their host's failure behavior.
 The runner requires an expiring task request in the protected broker config;
 Jev receives that request and facts from a successful worker preflight. These
 facts do not override permission thresholds or upload consent.
+The broker keeps up to 20 recent development actions and bounded worker output
+in memory for its lifetime. Later development and prepared-send checks receive
+that history as untrusted context, separate from the protected user request.
 The fixed literal writer stores probe source as data; executing that source
 is a separate guarded action. Standalone `python3 relative-probe.py` commands
 whose inspected source fits the bounded standard-library HTTP-client subset

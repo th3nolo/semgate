@@ -47,7 +47,7 @@ class _HarnessGate(Gate):
     def check_prepared(self, prepared: PreparedSend, *, consume_approval: bool = True):
         self.broker.ensure_current()
         return harness.check_prepared(prepared, consents=self.broker.consents, config=self.broker.config_path,
-                                      consume_approval=consume_approval)
+                                      consume_approval=consume_approval, recent=self.broker.recent_context())
 
 
 class _SnapshotTransport:
@@ -126,6 +126,7 @@ class PreparedBroker:
         self.sender = PreparedSender(_HarnessGate(self), self.consents, task_id=settings["task_id"],
                                      allow_loopback_http=settings.get("allow_loopback_http", False))
         self.lock = threading.Lock()
+        self.recent_actions: list[dict] = []
         self.items: dict[str, tuple[PreparedSend, float]] = {}
         self.busy: set[str] = set()
         self.completed: dict[str, tuple[dict, float]] = {}
@@ -229,6 +230,25 @@ class PreparedBroker:
         from .devworker import validate_write
         return self._development(write=validate_write(arguments))
 
+    def recent_context(self) -> list[dict]:
+        """Last 20 observations from this broker; never user instructions."""
+        from copy import deepcopy
+        with self.lock:
+            return deepcopy(self.recent_actions)
+
+    def _remember_development(self, command: str | None, write: dict | None, decision: str, result: dict) -> None:
+        output = "\n".join(str(result.get(key) or "")[:2900] for key in ("stdout", "stderr")).strip()
+        summary = command if command is not None else "write " + write["path"]
+        entry = {"tool": "bash" if command is not None else "write", "summary": summary[:500],
+                 "decision": decision, "output": output,
+                 "result": ("exit=" + str(result.get("exit_code", "unavailable"))
+                            + "; timeout=" + str(bool(result.get("timed_out")))),
+                 "files_changed": ([write["path"]] if write is not None and decision == "allow"
+                                   and result.get("exit_code") == 0 and not result.get("timed_out") else [])}
+        with self.lock:
+            self.recent_actions.append(entry)
+            self.recent_actions = self.recent_actions[-20:]
+
     def _development(self, *, command: str | None = None, write: dict | None = None) -> dict:
         self.ensure_current()
         self.task_request()
@@ -259,19 +279,26 @@ class PreparedBroker:
                 check = harness.check_local_write if write is not None else harness.check_development
                 decision = check(write if write is not None else command, project=self.settings["project_root"],
                                                      task=self.settings["task_id"], config=self.config_path,
-                                                     execution_facts=facts)
+                                                     execution_facts=facts, recent=self.recent_context())
                 if decision.decision != "allow":
+                    self._remember_development(command, write, decision.decision, {})
                     return {"disposition": "deny" if decision.decision == "deny" else "needs_inspection",
                             "reason_code": decision.reason_code, "delivery": "not_sent",
                             **({"approval_id": decision.evidence["approval_id"]} if decision.evidence.get("approval_id") else {})}
                 self.ensure_current()
                 self.task_request()
                 if self.sender.gate.grant.is_expired():
+                    self._remember_development(command, write, "deny", {})
                     return {"disposition": "deny", "reason_code": "development_operator_grant_expired",
                             "delivery": "not_sent"}
                 execute = self.development.write if write is not None else self.development.run
-                result = execute(self.settings["project_root"], write if write is not None else command,
-                                 protected=protected, expected_facts=facts)
+                try:
+                    result = execute(self.settings["project_root"], write if write is not None else command,
+                                     protected=protected, expected_facts=facts)
+                except Exception:
+                    self._remember_development(command, write, "unknown", {"stderr": "worker receipt unavailable"})
+                    raise
+                self._remember_development(command, write, "allow", result)
                 return {"disposition": "allow", "reason_code": "development_offline", "delivery": "not_sent", **result}
             except WriteConfinementError as exc:
                 # The project view cannot guarantee write confinement. Refuse
@@ -303,5 +330,7 @@ class PreparedBroker:
         return {"request_id": ident, "action": action}
 
     def close(self) -> None:
+        with self.lock:
+            self.recent_actions.clear()
         if self.development is not None:
             self.development.close()

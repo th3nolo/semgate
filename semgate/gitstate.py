@@ -30,14 +30,33 @@ States, per target path:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from . import proc
 
 RECOVERABLE = frozenset({"clean", "missing", "agent_created"})
+
+
+def _git_executable(cwd: str, project_root: str = "") -> Optional[str]:
+    """Pin an operator executable; never launch a writable project tool."""
+    found = shutil.which("git")
+    if not found:
+        return None
+    binary = Path(found).resolve(strict=True)
+    root = Path(project_root or cwd).resolve(strict=True)
+    if not project_root:
+        for parent in (root, *root.parents):
+            if (parent / ".git").exists():
+                root = parent
+                break
+    if not binary.is_file() or binary.is_relative_to(root):
+        return None
+    return str(binary)
 
 # Redirect sinks that write nothing to disk.
 _DEV_SINKS = re.compile(r"^/dev/(null|stdout|stderr|fd/\d+)$")
@@ -152,13 +171,16 @@ class GitFacts:
 
     def _git(self, cwd: str, *args: str) -> Tuple[int, str]:
         try:
+            binary = _git_executable(cwd, self.project_root)
+            if binary is None:
+                return 1, ""
             # Content comparisons may invoke clean/process drivers. Enumerate
             # their names without reading content, then disable every driver
             # for this read only. Never run a project helper as host evidence.
             env = dict(os.environ)
             env.pop("GIT_CONFIG", None)  # config-only redirect must not hide status configuration
             env["GIT_NO_LAZY_FETCH"] = "1"
-            prefix = ["git", "--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false"]
+            prefix = [binary, "--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false"]
             if args and args[0] == "status":
                 config = proc.run([*prefix, "config", "--includes", "--null", "--name-only", "--get-regexp",
                                    r"^filter\..*\.(clean|smudge|process|required)$"], cwd=cwd,
@@ -366,7 +388,12 @@ class GitHistory:
 
     def _git(self, cwd: str, *args: str) -> Tuple[int, str]:
         try:
-            p = proc.run(["git", "-c", "core.fsmonitor=false", *args], cwd=cwd, capture_output=True, text=True,
+            binary = _git_executable(cwd)
+            if binary is None:
+                return 1, ""
+            env = dict(os.environ, GIT_NO_LAZY_FETCH="1")
+            p = proc.run([binary, "--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false", *args],
+                        cwd=cwd, env=env, capture_output=True, text=True,
                                timeout=self.timeout)
             return p.returncode, p.stdout
         except Exception:

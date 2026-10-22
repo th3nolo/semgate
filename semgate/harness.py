@@ -396,7 +396,7 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
 
 
 def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path],
-                   consume_approval: bool = True) -> Any:
+                   consume_approval: bool = True, recent: Optional[List[dict]] = None) -> Any:
     """Trusted broker path through the complete hook/harness pipeline, synchronously.
 
     This function only judges. PreparedSender owns dispatch; a caller deadline
@@ -410,7 +410,7 @@ def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path],
     req = validate_request({"tool": "http_request", "arguments": prepared.arguments(),
                             "session_id": prepared.scope.task, "project_root": prepared.scope.project,
                             "cwd": prepared.scope.project,
-                            "user_message": task_request, "user_messages": [task_request]})
+                            "user_message": task_request, "user_messages": [task_request], "recent": recent or []})
     meta: Dict[str, Any] = {}
     out = judge_check(req, cfg, meta, prepared=prepared, consents=consents, consume_approval=consume_approval)
     # judge_check settles only ordinary approvable asks, after privacy passes.
@@ -427,25 +427,25 @@ def _task_request(config: dict, task: str, project: str) -> str:
 
 
 def check_development(command: str, *, project: str, task: str, config: Union[str, Path],
-                      execution_facts: Any = None) -> Any:
+                      execution_facts: Any = None, recent: Optional[List[dict]] = None) -> Any:
     """Broker-only check. An allow may execute only through OfflineWorker."""
     return _check_development("bash", {"command": command}, project=project, task=task,
-                              config=config, execution_facts=execution_facts)
+                              config=config, execution_facts=execution_facts, recent=recent)
 
 
 def check_local_write(arguments: dict, *, project: str, task: str, config: Union[str, Path],
-                      execution_facts: Any) -> Any:
+                      execution_facts: Any, recent: Optional[List[dict]] = None) -> Any:
     from .devworker import validate_write
     literal = validate_write(arguments)
     # Scope rules compare host paths; the worker receives the same project-
     # relative name and independently refuses symlink traversal in its namespace.
     literal["path"] = str(Path(project) / literal["path"])
     return _check_development("write", literal, project=project, task=task,
-                              config=config, execution_facts=execution_facts)
+                              config=config, execution_facts=execution_facts, recent=recent)
 
 
 def _check_development(tool: str, arguments: dict, *, project: str, task: str, config: Union[str, Path],
-                       execution_facts: Any) -> Any:
+                       execution_facts: Any, recent: Optional[List[dict]] = None) -> Any:
     from .judge import Decision
     cfg = load_config(config)
     if cfg.get("mode") != "enforce":
@@ -465,7 +465,7 @@ def _check_development(tool: str, arguments: dict, *, project: str, task: str, c
     task_request = _task_request(cfg, task, project)
     req = validate_request({"tool": tool, "arguments": arguments,
                             "session_id": task, "project_root": project, "cwd": project,
-                            "user_message": task_request, "user_messages": [task_request]})
+                            "user_message": task_request, "user_messages": [task_request], "recent": recent or []})
     meta: Dict[str, Any] = {}
     out = _record_answer(cfg, req, judge_check(req, cfg, meta, offline_shell=True,
                                             execution_facts=execution_facts, execution_paths=paths), meta)
