@@ -200,6 +200,16 @@ def antigravity_decision(sem: Decision, config: Mapping[str, Any], tool: str,
     problem = enforce_cfg.mode_problem(config)
     if problem:
         return enforce_cfg.fail_closed(problem, chat_host, config)
+    if sem.stage == "privacy" and not enforce_cfg.is_shadow(config):
+        # Never offer ordinary feedback/chat approval for an uninspected or
+        # disputed payload. Hosts that cannot reliably prompt must block it.
+        decision = "deny" if sem.decision == "deny" or not enforce_cfg.shows_ask(chat_host) else "force_ask"
+        if sem.reason_code == "privacy_prepared_send_required":
+            return {"decision": "deny", "reason": "semgate privacy: privacy_prepared_send_required; "
+                    "use the configured prepared-send client: prepare and dispatch for uploads, "
+                    "or run for a configured offline development worker. Direct host shell execution is disabled."}
+        return {"decision": decision, "reason": (f"semgate privacy: {sem.reason_code}; "
+                "the data, recipient and purpose must pass privacy inspection before retrying.")}
     result = _base_decision(sem, config, tool)
     # YOLO guard: when the host auto-runs (no prompt), a "please ask" is not safe
     # because it becomes a silent run. block_when_unsure turns every ask/force_ask
@@ -422,6 +432,10 @@ def _run_core(
     extra_evidence: Optional[Dict[str, Any]] = None,
     chat: Any = None,
     _after_pin: bool = False,
+    prepared_disclosure: Any = None,
+    consent_store: Any = None,
+    trusted_offline_shell: bool = False,
+    trusted_execution_facts: Any = None,
 ) -> Dict[str, Any]:
     """Host-neutral decision pipeline shared by every hook adapter.
 
@@ -487,6 +501,12 @@ def _run_core(
         provider = RecordedProvider()
     elif provider_name != "none":
         return enforce_cfg.fail_closed(f"semgate: unknown provider {provider_name!r}", chat_host, config, ask_as=ask_word)
+    from .privacy import from_config as privacy_from_config
+    from .providers.safe import configured as privacy_provider
+    privacy_gate = privacy_from_config(config)
+    if privacy_gate is not None and prepared_disclosure is not None:
+        privacy_gate.consents = consent_store
+    provider = privacy_provider(provider, config)
     # Work kinds: the purpose Jev judges against is composed from every kind of
     # work the user has asked for this session (see profiles.py). The grant's
     # hard scope (forbidden patterns, expiry) is untouched; kinds may only add
@@ -500,6 +520,8 @@ def _run_core(
                                         provider=provider, table=table)
         grant = _profiles.apply(grant, kinds, table)
     envelope = build_envelope(grant)
+    from .sendclient import verified_invocation
+    trusted_send_client = verified_invocation(envelope, config)
     # semgate's own earlier answers in this session, which the host shows as
     # the blocked call's result, are not untrusted content: each copy in the
     # output of the same action is replaced before any scan (ownmessages.py).
@@ -564,7 +586,9 @@ def _run_core(
                 extra_evidence=extra_evidence, trust=trust_store, pins=pin_view,
                 # The hook runs as a child of the agent CLI: this PATH is the one
                 # the agent's commands use (folders on it count for persistence_link).
-                path_env=os.environ.get("PATH", ""))
+                path_env=os.environ.get("PATH", ""), privacy_gate=privacy_gate, prepared_disclosure=prepared_disclosure,
+                trusted_send_client=trusted_send_client, trusted_offline_shell=trusted_offline_shell,
+                trusted_execution_facts=trusted_execution_facts)
     # A command from a project instruction file whose lines the user has not
     # pinned (pingate.py). On the retry after semgate's question, the user's
     # yes in chat pins exactly the lines semgate quoted; then the same action
@@ -576,7 +600,9 @@ def _run_core(
         return run_core(config, build_envelope=build_envelope, session_id=session_id, step_idx=step_idx,
                         user_messages=user_messages, meta=meta, record_step=record_step,
                         session_started_at=session_started_at, payload=payload, store_problems=store_problems,
-                        extra_evidence=extra_evidence, chat=chat, _after_pin=True)
+                        extra_evidence=extra_evidence, chat=chat, _after_pin=True,
+                        prepared_disclosure=prepared_disclosure, consent_store=consent_store,
+                        trusted_offline_shell=trusted_offline_shell, trusted_execution_facts=trusted_execution_facts)
     from .filelock import LockTimeout
     lock_failures: List[str] = []
     step_for_record = step_idx if record_step == "__same__" else record_step
@@ -600,7 +626,10 @@ def _run_core(
         # judged_*: the judge's own answer, for callers that report it next to
         # the final answer (semgate.harness). Never read back by the pipeline.
         meta.update(tool=envelope.action.tool, content_digest=sem.envelope_digest, judged_stage=sem.stage,
-                    judged_decision=sem.decision, judged_reason_code=sem.reason_code)
+                    judged_decision=sem.decision, judged_reason_code=sem.reason_code,
+                    privacy_blocked=sem.stage == "privacy" and sem.decision != "allow")
+        if prepared_disclosure is not None:
+            meta["prepared_privacy"] = sem.evidence.get("privacy", {})
     if history is not None:
         # The PostToolUse hook joins on (conversationId, stepIdx).
         try:
@@ -613,6 +642,8 @@ def _run_core(
             lock_failures.append(f"the tool-history pending record ({exc})")
     chat_ok = chat_can_approve(chat_host)
     result = antigravity_decision(sem, config, envelope.action.tool, chat_host=chat_host)
+    if sem.stage == "privacy":
+        return _apply_deny_escalation(result, config, envelope.environment.session_id, False)
     for what in lock_failures:
         result = _store_failed(result, what)
     for what in (store_problems or []):

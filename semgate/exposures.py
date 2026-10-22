@@ -308,7 +308,8 @@ def _intent_provider(config: Mapping[str, Any]) -> Tuple[Any, str]:
         return FakeProvider(script=config.get("fake_answers") or {}, fail=bool(config.get("provider_fail"))), ""
     if name in LIVE_PROVIDERS:
         from .providers.registry import live_provider
-        return live_provider(name, str(config.get("judge_model") or "") or None), ""
+        from .providers.safe import configured
+        return configured(live_provider(name, str(config.get("judge_model") or "") or None), config), ""
     return None, f"no judge (provider {name})"
 
 

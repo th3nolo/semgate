@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, Union
 
 from .envelope import (AGENT_INTENT_MAX, Envelope, Environment, ProposedAction, SCHEMA_VERSION, Trajectory, TrajectoryEntry,
                        UserGrant, bound_user_messages, utcnow_iso)
@@ -41,6 +41,9 @@ from .ledger import Ledger
 from .policy import Policy
 from .providers.base import JudgeProvider
 from .providers.registry import LIVE as LIVE_PROVIDERS
+
+if TYPE_CHECKING:
+    from .preparedsend import PreparedSend
 
 def policy_dir() -> Path:
     """Where the shipped policy files are. In a wheel they are the
@@ -130,11 +133,13 @@ class Gate:
         session_id: str = "",
         git_facts: bool = False,
         script_source: bool = False,
+        privacy_gate: Optional[Any] = None,
     ) -> None:
         if not purpose or not purpose.strip():
             raise ValueError("Gate needs a purpose: what the operator authorised this agent to do")
         self.policy = _policy(policy)
         self.provider = _provider(provider, model)
+        self.privacy_gate = privacy_gate
         if isinstance(grant, UserGrant):
             self.grant = grant
         else:
@@ -215,4 +220,19 @@ class Gate:
         env = self.envelope(command, tool=tool, user_message=user_message, recent=recent, cwd=cwd, arguments=arguments,
                             user_messages=user_messages, agent_intent=agent_intent)
         return judge(env, self.policy, provider=self.provider, ledger=self.ledger, facts=self.facts, workspace=self.workspace,
-                     path_env=os.environ.get("PATH", ""))
+                     path_env=os.environ.get("PATH", ""), privacy_gate=self.privacy_gate)
+
+    def check_prepared(self, prepared: PreparedSend) -> Decision:
+        """Trusted embedding path used by PreparedSender; still never executes.
+
+        Operator grant scope, hard rules and ordinary permission gates all run.
+        Task consent can only clear privacy for the bound immutable payload.
+        """
+        from .preparedsend import PreparedSend
+        from .privacyconsent import POLICY_VERSION
+        if (self.privacy_gate is None or not isinstance(prepared, PreparedSend)
+                or prepared.scope.policy_version != POLICY_VERSION + ":" + self.policy.version):
+            return Decision("deny", stage="privacy", reason_code="privacy_prepared_context_required")
+        env = self.envelope("", tool="http_request", arguments=prepared.arguments())
+        return judge(env, self.policy, provider=self.provider, ledger=self.ledger, facts=self.facts, workspace=self.workspace,
+                     path_env=os.environ.get("PATH", ""), privacy_gate=self.privacy_gate, prepared_disclosure=prepared)

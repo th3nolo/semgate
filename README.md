@@ -10,6 +10,34 @@ Let the agent do the work you delegated without quietly expanding what you gave 
 
 semgate evaluates proposed tool calls against the operator's scope, the user's requests, and the available execution context. It returns `allow`, `ask`, or `deny`. The agent's host decides whether the call runs, requires approval, or is blocked.
 
+For upload protection that survives advisory hook crashes or timeouts, use the
+[Semgate-owned Codex runner](docs/guide.md#codex-with-semgate-owned-execution).
+It provides ordinary development through an offline Linux worker and routes
+uploads through PreparedSender with current task consent. Hook-only integrations
+still depend on their host's failure behavior.
+The runner requires an expiring task request in the protected broker config;
+Jev receives that request and facts from a successful worker preflight. These
+facts do not override permission thresholds or upload consent.
+The fixed literal writer stores probe source as data; executing that source
+is a separate guarded action. Standalone `python3 relative-probe.py` commands
+whose inspected source fits the bounded standard-library HTTP-client subset
+can run as a pinned snapshot with system Python `-I -B`, a read-only project,
+and the existing offline network boundary. The model still judges the exact
+source at the same thresholds. Unsupported code keeps its normal guards.
+The snapshot digest in the receipt identifies the actual executed bytes;
+later file changes cannot replace those bytes. File URLs/opens, reflection,
+dynamic calls, project imports and API mutation are outside the subset.
+Normal development commands retain their writable offline workspace.
+In the protected runner, `rm -rf __pycache__`
+(also `-fr`, optional `--`, and optional `&& git status --short`) uses a fixed
+reversible cache adapter. It moves the entire root cache into
+`.semgate/cache-recovery/<recovery_id>/tree` in the same project and records
+its original location in `manifest.json`. It retains unexpected contents too.
+The receipt identifies the recovery copy; an operator can move `tree` back
+when the original path is absent and no worker is active. Copies are retained
+until the operator chooses to remove them. Other deletion commands keep their
+normal guards. The adapter still requires an allow decision at the existing thresholds.
+
 The question is not only **"""Can this command damage the machine?"""** It is also **"""Is this action authorized, does it serve the task, and what evidence supports that judgment?"""**
 
 That includes ordinary-looking development actions: skipping tests instead of fixing a bug, making unrelated changes, following instructions planted in a README, or treating an ambiguous reply as permission. The project combines runtime permission controls with evaluations of these behaviors. It does not assume that a successful tool call means the agent completed the task correctly.

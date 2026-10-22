@@ -7,7 +7,7 @@
   "required": ["schema", "decision", "reason", "reason_code", "stage", "judgment_id"],
   "properties": {
     "schema": {"const": "semgate-decision/1"},
-    "decision": {"enum": ["allow", "ask", "deny"], "description": "allow: run it. ask: a human decides (use approval_id). deny: do not run it; give reason to the model."},
+    "decision": {"enum": ["allow", "ask", "deny"], "description": "allow: run it. ask: do not run; use approval_id when present. Privacy reviews require resolving the privacy check and have no approval_id. deny: do not run it; give reason to the model."},
     "reason": {"type": "string", "maxLength": 1000, "description": "Why, for the human and the model. Secret values and the home folder are masked."},
     "reason_code": {"type": "string", "description": "Machine-readable code: the judge's code (e.g. hard_deny, injection_deny, human_gate:credentials_secrets, aligned_readonly_allow), or human_approved_once, human_denied, semgate_timeout, semgate_failure."},
     "stage": {"type": "string", "description": "The judge's stage: hard_rules, human_gate, semantic, trusted, human_approved, ... Empty when semgate failed before judging."},

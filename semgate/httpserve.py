@@ -7,6 +7,15 @@
                        200: {approval_id, status, expires_at}; 404 unknown/expired id; 409 already answered/used
     GET  /v1/health    200: {ok, service, version, request_schema, response_schema, workers, stuck}
 
+    Opt-in prepared execution (docs/guide.md, "Prepared execution in the HTTP harness"):
+    POST /v1/send/prepare   agent: {route}; immutable server-side snapshot + typed outcome
+    POST /v1/send/dispatch  agent: {prepared_id}; recheck + send once + delivery receipt
+    POST /v1/send/run       agent: {command}; ordinary permission check + offline development worker
+    POST /v1/send/describe  operator: {prepared_id}; scope/digest/categories, no body
+    POST /v1/send/consent   operator: {action: approve|revoke|close-task, request_id, task_scope?, ttl_s?}
+    These endpoints require distinct agent/operator tokens. Dispatch is synchronous
+    and never enters the abandonable judgment worker pool described below.
+
 Workers and deadlines are serve.Server's (the `semgate serve --stdio`
 pool): a bounded pool of judge threads (`serve.workers`, default 4), a
 deadline per request (`serve.budget_ms` minus `serve.margin_ms`, or the
@@ -161,6 +170,8 @@ class HttpGate:
         self.retired: List[Server] = []
         self.recycles = 0
         self.pool = self._new_pool()
+        self.prepared = None
+        self.prepared_lock = threading.Lock()
 
     # ---------- pool ----------
     def _new_pool(self) -> Server:
@@ -211,6 +222,66 @@ class HttpGate:
         if hmac.compare_digest(self._bearer(authorization).encode(), token.encode()):
             return True, ""
         return False, "missing or wrong bearer token for approvals"
+
+    def prepared_allowed(self, authorization: Optional[str], *, operator: bool) -> bool:
+        # No legacy shared-token fallback for disclosure authority.
+        if not self.check_token or not self.approve_token or hmac.compare_digest(self.check_token, self.approve_token):
+            return False
+        expected = self.approve_token if operator else self.check_token
+        return hmac.compare_digest(self._bearer(authorization).encode(), expected.encode())
+
+    def prepared_action(self, action: str, body: bytes) -> Tuple[int, Dict[str, Any]]:
+        """Synchronous execution path; never enters the abandonable judgment pool."""
+        try:
+            if len(body) > (32768 if action == "write" else 24576 if action == "run" else 4096):
+                raise ValueError("prepared request limit")
+            request = json.loads(body)
+            from .sendclient import _ID, _NAME
+            if not isinstance(request, dict):
+                raise ValueError("prepared request must be an object")
+            if action == "write":
+                from .devworker import validate_write
+                request = validate_write(request)
+            elif action == "run":
+                from .devworker import MAX_COMMAND
+                if (set(request) != {"command"} or not isinstance(request["command"], str)
+                        or not request["command"].strip() or len(request["command"]) > MAX_COMMAND or "\0" in request["command"]):
+                    raise ValueError("invalid development command")
+            elif action == "prepare":
+                if set(request) != {"route"} or not isinstance(request["route"], str) or not _NAME.fullmatch(request["route"]):
+                    raise ValueError("invalid prepared route")
+            elif action in {"dispatch", "describe"}:
+                if set(request) != {"prepared_id"} or not isinstance(request["prepared_id"], str) or not _ID.fullmatch(request["prepared_id"]):
+                    raise ValueError("invalid prepared id")
+            elif action == "consent":
+                if (set(request) - {"action", "request_id", "task_scope", "ttl_s"} or not {"action", "request_id"} <= set(request)
+                        or request["action"] not in {"approve", "revoke", "close-task"}
+                        or not isinstance(request["request_id"], str) or not _ID.fullmatch(request["request_id"])):
+                    raise ValueError("invalid consent request")
+            else:
+                raise ValueError("unknown prepared action")
+            from .sendharness import PreparedBroker
+            with self.prepared_lock:
+                if self.prepared is None:
+                    self.prepared = PreparedBroker(self.config_path)
+                broker = self.prepared
+            if action == "run":
+                result = broker.run_development(request["command"])
+            elif action == "write":
+                result = broker.write_development(request)
+            elif action == "prepare":
+                result = broker.prepare(request["route"])
+            elif action == "dispatch":
+                result = broker.dispatch(request["prepared_id"])
+            elif action == "describe":
+                result = broker.describe(request["prepared_id"])
+            else:
+                result = broker.consent(request)
+            return 200, result
+        except Exception:
+            # Do not log bodies, credentials, scope text or raw exceptions.
+            return 503, {"disposition": "service_error", "reason_code": "prepared_harness_error",
+                         "delivery": "unknown" if action == "dispatch" else "not_sent"}
 
     # ---------- endpoints ----------
     def health(self) -> Dict[str, Any]:
@@ -294,13 +365,17 @@ class HttpGate:
             return 500, {"error": f"semgate failure: {harness.failure_text(exc)}"}
 
     def close(self) -> None:
-        with self.lock:
-            pools = [self.pool] + self.retired
-        for p in pools:
-            try:
-                p.close()
-            except Exception:
-                pass
+        try:
+            if self.prepared is not None:
+                self.prepared.close()
+        finally:
+            with self.lock:
+                pools = [self.pool] + self.retired
+            for p in pools:
+                try:
+                    p.close()
+                except Exception:
+                    pass
 
 
 def _handler_class(gate: HttpGate, allow_remote: bool) -> type:
@@ -421,14 +496,19 @@ def _handler_class(gate: HttpGate, allow_remote: bool) -> type:
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
-            if path not in ("/v1/check", "/v1/approve"):
+            send_actions = {"/v1/send/" + name: name for name in ("prepare", "dispatch", "describe", "consent", "run", "write")}
+            if path not in ("/v1/check", "/v1/approve") and path not in send_actions:
                 self._send(404, {"error": "not found"})
                 return
             is_check = path == "/v1/check"
             if not self._origin_and_host_ok(is_check):
                 return
             auth = self.headers.get("Authorization")
-            if is_check:
+            if path in send_actions:
+                if not gate.prepared_allowed(auth, operator=send_actions[path] in {"describe", "consent"}):
+                    self._refuse(403, "prepared sends require separate agent and operator tokens", False)
+                    return
+            elif is_check:
                 if not gate.check_allowed(auth):
                     self._refuse(401, "missing or wrong bearer token", True, {"WWW-Authenticate": "Bearer"})
                     return
@@ -442,7 +522,10 @@ def _handler_class(gate: HttpGate, allow_remote: bool) -> type:
             body = self._body(is_check)
             if body is None:
                 return
-            status, obj = gate.check(body) if is_check else gate.approve(body)
+            if path in send_actions:
+                status, obj = gate.prepared_action(send_actions[path], body)
+            else:
+                status, obj = gate.check(body) if is_check else gate.approve(body)
             self._send(status, obj)
 
         def _not_allowed(self) -> None:

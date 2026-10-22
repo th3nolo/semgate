@@ -54,7 +54,7 @@ class Ledger:
         file, unless spill is False); callers fail closed."""
         filelock.append_record(self.path, record, spill=spill)
 
-    def record_judgment(self, envelope: Envelope, decision: "Any") -> str:
+    def record_judgment(self, envelope: Envelope, decision: "Any", *, private: bool = False) -> str:
         record = {
             "record_type": "judgment",
             "judgment_id": decision.envelope_digest,
@@ -62,6 +62,29 @@ class Ledger:
             "decision": decision.to_dict(),
             "envelope": envelope.to_dict(),
         }
+        if private:
+            from .privacydata import safe_inputs
+            try:
+                record, _ = safe_inputs(record, {})
+                record["privacy_minimized"] = True
+                if record["envelope"]["environment"].get("session_id") != envelope.environment.session_id:
+                    record["privacy_session_unattributed"] = True
+            except Exception:
+                # Inspection overflow must never fall back to writing the raw
+                # envelope or exception message. Missing history stays unknown.
+                record = {"record_type": "judgment", "judgment_id": decision.envelope_digest,
+                          "ts": decision.evaluated_at, "privacy_minimized": True, "envelope_omitted": True,
+                          "privacy_window_incomplete": True,
+                          "envelope": {"environment": {"session_id": ""}},
+                          "decision": {"decision": decision.decision, "stage": decision.stage,
+                                       "reason_code": decision.reason_code}}
+                from .privacydata import Minimizer
+                try:
+                    record["envelope"]["environment"]["session_id"] = Minimizer().text(envelope.environment.session_id)
+                except Exception:
+                    pass
+                if record["envelope"]["environment"]["session_id"] != envelope.environment.session_id:
+                    record["privacy_session_unattributed"] = True
         self._append(record)
         return decision.envelope_digest
 
@@ -207,7 +230,8 @@ class Ledger:
         needle = filelock.json_needle(sid)
         for spill in filelock.spill_files(self.path):
             try:
-                if needle in spill.read_bytes():
+                spill_bytes = spill.read_bytes()
+                if needle in spill_bytes or b'"privacy_session_unattributed"' in spill_bytes:
                     raise IncompleteWindow(f"a record of this session is in {spill.name} (lock timeout)")
             except OSError as exc:
                 raise IncompleteWindow(f"cannot read {spill.name}: {exc}")
@@ -215,6 +239,9 @@ class Ledger:
             raw = filelock.read_bytes_locked(self.path)
         except (filelock.LockTimeout, OSError) as exc:
             raise IncompleteWindow(f"ledger not readable: {type(exc).__name__}: {exc}")
+        if b'"privacy_session_unattributed"' in raw:
+            if any(r.get("privacy_session_unattributed") is True for r in filelock.parse_jsonl_bytes(raw).records):
+                raise IncompleteWindow("privacy-minimized history contains an unattributed session")
         first = raw.find(needle)
         if first < 0:
             return []
@@ -229,6 +256,10 @@ class Ledger:
                 continue
             env = r.get("envelope") or {}
             d = r.get("decision") or {}
+            if (r.get("privacy_minimized") and str((env.get("environment") or {}).get("session_id", "")) == sid
+                    and not (exclude and r.get("judgment_id") == exclude)
+                    and (r.get("privacy_window_incomplete") or (d.get("stage") == "semantic" and turn_key(env) != key))):
+                raise IncompleteWindow("privacy-minimized history cannot establish the user-turn window")
             if (str((env.get("environment") or {}).get("session_id", "")) != sid
                     or d.get("stage") != "semantic" or (exclude and r.get("judgment_id") == exclude)
                     or turn_key(env) != key):

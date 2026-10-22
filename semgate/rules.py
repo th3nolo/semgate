@@ -564,7 +564,7 @@ def path_within(path: str, prefixes: Tuple[str, ...]) -> bool:
     return False
 
 
-def check_grant_scope(envelope: Envelope) -> List[str]:
+def check_grant_scope(envelope: Envelope, *, trusted_send_client: bool = False) -> List[str]:
     """Return a list of scope violations; empty list means in scope."""
     grant = envelope.grant
     violations: List[str] = []
@@ -581,6 +581,15 @@ def check_grant_scope(envelope: Envelope) -> List[str]:
     if grant.allowed_path_prefixes:
         own = own_program_words(_command(envelope))
         for path in extract_paths(envelope):
+            if trusted_send_client:
+                # The hook verified the entire isolated argv before setting
+                # this flag. These two exact files are its implementation,
+                # not project resources selected by the agent.
+                import sys
+                from pathlib import Path
+                from . import sendclient
+                if Path(path).resolve() in {Path(sys.executable).resolve(), Path(sendclient.__file__).resolve()}:
+                    continue
             # semgate's own skill (installed by `semgate init`) tells the agent
             # how to act on semgate's answers: the read tool may read it even
             # when the grant limits paths to the project.
@@ -677,7 +686,7 @@ def semgate_state_code_write(command: str) -> str:
     return ""
 
 
-def check_hard_deny(envelope: Envelope) -> RuleResult:
+def check_hard_deny(envelope: Envelope, *, trusted_send_client: bool = False) -> RuleResult:
     text = _hard_text(envelope)
     for pattern in HARD_DENY_PATTERNS:
         match = pattern.search(text)
@@ -726,7 +735,7 @@ def check_hard_deny(envelope: Envelope) -> RuleResult:
             if hit:
                 return RuleResult(outcome="deny", rule="trust_grant_scope",
                                   detail=f"semgate trust add of a command the grant forbids (pattern {hit!r}); it can never be trusted")
-    violations = check_grant_scope(envelope)
+    violations = check_grant_scope(envelope, trusted_send_client=trusted_send_client)
     if violations:
         return RuleResult(outcome="deny", rule="grant_scope", detail="; ".join(violations))
     return RuleResult(outcome="none")
@@ -1068,7 +1077,7 @@ def script_catastrophic_deny(scripts: List["Any"], project_root: str = "") -> Ru
     return RuleResult(outcome="none")
 
 
-def script_gate_hits(scripts: List["Any"], project_root: str = "", path_dirs: Sequence[str] = ()) -> List[GateHit]:
+def script_gate_hits(scripts: List["Any"], project_root: str = "", path_dirs: Sequence[str] = (), *, offline_network: bool = False) -> List[GateHit]:
     """F4: gates over the content of local script files the command runs
     (scriptsource.ScriptFile). The same checks inline code gets: human gates,
     the network-library check, and the hard-deny patterns. A hard-deny pattern
@@ -1098,7 +1107,7 @@ def script_gate_hits(scripts: List["Any"], project_root: str = "", path_dirs: Se
                     add(gate_class, script.rel, match.group(0)[:120])
                     break
         net = script_network_hit(scriptsource.code_for_network_check(script))
-        if net:
+        if net and not offline_network:
             add("embedded_execution", script.rel, f"network use: {net}")
         # Links the script creates: ln and friends in shell scripts, os.symlink,
         # Path.symlink_to, fs.symlinkSync ... with literal paths in Python and

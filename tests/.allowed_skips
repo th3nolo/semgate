@@ -44,3 +44,9 @@ wsl,posix: ^tomllib needs Python 3\.11\+$
 # Windows-only behaviour tested on Windows.
 wsl,posix: ^Windows file names ignore case$
 wsl,posix: ^backslashes are escapes in bash; the skill writes forward slashes$
+# The real-kernel worker suite needs a Linux bubblewrap; it runs in the WSL copy
+# only when that copy has one, and skips everywhere else.
+any: ^requires existing Linux bubblewrap >=0\.12\.0$
+# The directory-junction cases are Windows-only: a junction is a Windows name
+# surrogate, and the POSIX filesystems have no equivalent.
+wsl,posix: ^Windows directory junctions$

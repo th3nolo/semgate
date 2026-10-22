@@ -53,6 +53,9 @@ PATH_KEYS: Tuple[Tuple[Tuple[str, ...], Optional[str]], ...] = (
     (("secret_exposures", "key_file"), "fingerprint.key"),
     (("agent_files", "dir"), None),
     (("trust", "file"), None),
+    (("prepared_sends", "project_root"), None),
+    (("prepared_sends", "client_file"), None),
+    (("prepared_sends", "consent_store"), None),
 )
 AGENT_FILES_DEFAULT = "~/.semgate"
 

@@ -589,6 +589,10 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Long-running judge: --stdio (OpenCode/Pi plugins) or --http (any harness: POST /v1/check)")
     p_serve.add_argument("serve_args", nargs=argparse.REMAINDER)   # handled before parsing (see the top of main)
 
+    p_agent = sub.add_parser("agent", add_help=False,
+                             help="Codex with Semgate-owned tools: offline development and prepared uploads")
+    p_agent.add_argument("agent_args", nargs=argparse.REMAINDER)   # own parser in codexrunner.main
+
     p_h = sub.add_parser("harness", help="Set up semgate for your own harness (Python API or semgate serve --http)")
     h_sub = p_h.add_subparsers(dest="harness_command", required=True)
     p_hi = h_sub.add_parser("init", help="Write semgate.json, grant.json, check.token and approve.token")
@@ -615,6 +619,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_report(sub)
     from .doctor import add_parser as _add_doctor
     _add_doctor(sub)
+    from .privacyconsent_cli import add_parser as _add_consent
+    _add_consent(sub)
 
     return parser
 
@@ -637,6 +643,9 @@ def main(argv=None) -> int:
     if argv[:1] == ["serve"]:           # its own parser (serve.main): --stdio | --http and their options
         from .serve import main as serve_main
         return serve_main(argv[1:])
+    if argv[:1] == ["agent"]:
+        from .codexrunner import main as agent_main
+        return agent_main(argv[1:])
     args = parse_args(argv)
     return args.func(args)
 

@@ -41,6 +41,8 @@ What differs from a hook host (and why):
     given when the judge itself said deny (every answer is ask in shadow
     mode) or the grant expired: like `semgate feedback allow`, an approval
     never opens those.
+    Privacy-stage asks also have no approval id: the payload must pass its
+    privacy check before any ordinary approval can be applied.
   - the deny text for the agent does not say "ask the user in chat, then
     re-run" (that is the chat approval flow); it says the action was blocked.
   - no post-tool event: tool outputs come in `recent` with each request, so
@@ -346,7 +348,8 @@ def _ledger_event(config: Mapping[str, Any], event: str, detail: Dict[str, Any])
 
 
 def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optional[Dict[str, Any]] = None,
-                line_bytes: int = 0) -> Dict[str, Any]:
+                line_bytes: int = 0, *, prepared: Any = None, consents: Any = None,
+                offline_shell: bool = False, execution_facts: Any = None) -> Dict[str, Any]:
     """One check through run_core and the approval step. `req` is validated
     here (again). Returns the answer object (not yet recorded as
     host_response: the caller does that, as serve does). Raises on errors;
@@ -372,6 +375,8 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
         session_started_at=lambda: req["session_started_at"],
         meta=meta,
         chat=None,       # no approval by chat reply on this path (see the module text)
+        prepared_disclosure=prepared, consent_store=consents, trusted_offline_shell=offline_shell,
+        trusted_execution_facts=execution_facts,
     )
     decision = _TO_HOST.get(str(result.get("decision")), "ask")
     reason = str(result.get("reason", ""))
@@ -382,10 +387,81 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
                            "stage": str(meta.get("judged_stage", "") or ""),
                            "judgment_id": str(meta.get("content_digest", "") or "")}
     env = built.get("envelope")
-    if env is not None and decision in ("allow", "ask"):
+    if env is not None and decision in ("allow", "ask") and not meta.get("privacy_blocked"):
         out = _approval_step(out, env, config, req, meta)
     out["reason"] = public_text(out["reason"])[:1000]
     return out
+
+
+def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path]) -> Any:
+    """Trusted broker path through the complete hook/harness pipeline, synchronously.
+
+    This function only judges. PreparedSender owns dispatch; a caller deadline
+    must never abandon a worker that can later perform an undisclosed send.
+    """
+    from .judge import Decision
+    cfg = load_config(config)
+    if cfg.get("mode") != "enforce":
+        return Decision("deny", stage="privacy", reason_code="prepared_harness_requires_enforce")
+    req = validate_request({"tool": "http_request", "arguments": prepared.arguments(),
+                            "session_id": prepared.scope.task, "project_root": prepared.scope.project,
+                            "cwd": prepared.scope.project,
+                            "user_message": _task_request(cfg, prepared.scope.task, prepared.scope.project)})
+    meta: Dict[str, Any] = {}
+    out = judge_check(req, cfg, meta, prepared=prepared, consents=consents)
+    if meta.get("judged_decision") != "allow" and out["decision"] == "allow":
+        out = dict(out, decision="ask")
+    out = _record_answer(cfg, req, out, meta)
+    return Decision(out["decision"], reasons=[out["reason"]], stage=out["stage"], reason_code=out["reason_code"],
+                    envelope_digest=out["judgment_id"], evidence={"privacy": meta.get("prepared_privacy", {})})
+
+
+def _task_request(config: dict, task: str, project: str) -> str:
+    from .taskcontext import request_for
+    return request_for(config, task=task, project=project)
+
+
+def check_development(command: str, *, project: str, task: str, config: Union[str, Path],
+                      execution_facts: Any = None) -> Any:
+    """Broker-only check. An allow may execute only through OfflineWorker."""
+    return _check_development("bash", {"command": command}, project=project, task=task,
+                              config=config, execution_facts=execution_facts)
+
+
+def check_local_write(arguments: dict, *, project: str, task: str, config: Union[str, Path],
+                      execution_facts: Any) -> Any:
+    from .devworker import validate_write
+    literal = validate_write(arguments)
+    # Scope rules compare host paths; the worker receives the same project-
+    # relative name and independently refuses symlink traversal in its namespace.
+    literal["path"] = str(Path(project) / literal["path"])
+    return _check_development("write", literal, project=project, task=task,
+                              config=config, execution_facts=execution_facts)
+
+
+def _check_development(tool: str, arguments: dict, *, project: str, task: str, config: Union[str, Path],
+                       execution_facts: Any) -> Any:
+    from .judge import Decision
+    cfg = load_config(config)
+    if cfg.get("mode") != "enforce":
+        return Decision("deny", reason_code="development_requires_enforce")
+    # The broker has a real project checkout: inspect its recovery state rather
+    # than asking the model to guess whether a shell overwrite loses work.
+    # GitFacts is read-only; dirty/untracked targets still withhold an allow.
+    # Keep the public check API and unverified judgment path unchanged.
+    if execution_facts is not None:
+        from .devworker import VerifiedOfflineFacts
+        if not isinstance(execution_facts, VerifiedOfflineFacts):
+            raise ValueError("verified execution facts required")
+        cfg = dict(cfg, git_facts=True)
+    req = validate_request({"tool": tool, "arguments": arguments,
+                            "session_id": task, "project_root": project, "cwd": project,
+                            "user_message": _task_request(cfg, task, project)})
+    meta: Dict[str, Any] = {}
+    out = _record_answer(cfg, req, judge_check(req, cfg, meta, offline_shell=True,
+                                            execution_facts=execution_facts), meta)
+    return Decision(out["decision"], reasons=[out["reason"]], stage=out["stage"], reason_code=out["reason_code"],
+                    evidence={"approval_id": out.get("approval_id", "")})
 
 
 def _approval_step(out: Dict[str, Any], env: Any, config: Mapping[str, Any], req: Mapping[str, Any],
