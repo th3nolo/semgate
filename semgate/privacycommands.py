@@ -111,6 +111,10 @@ def file_references(command: str) -> CommandFiles:
                     else:
                         result.problem("missing_payload_argument")
             continue
+        if tokens[0] is not simple.tokens[0]:
+            # Shared shell parsing unwraps programs for other gates; it does
+            # not establish a wrapper's cwd or payload semantics here.
+            result.problem("unsupported_curl_context")
         if any(t.redirect or t.substitutions for t in simple.tokens) or simple.heredocs:
             result.problem("indirect_payload")
         index = 1
