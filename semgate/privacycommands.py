@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 from typing import List
+from urllib.parse import quote
 
 from . import shellparse
 
@@ -26,6 +27,8 @@ class CommandFiles:
     references: List[str] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
     inline_json: List[str] = field(default_factory=list)
+    inline_forms: List[str] = field(default_factory=list)
+    changes_directory: bool = False
 
     def problem(self, code: str) -> None:
         if code not in self.problems:
@@ -51,6 +54,10 @@ def _payload(result: CommandFiles, option: str, value: str) -> None:
         # curl's name@file form differs from name=value and literal content.
         if "@" in value and ("=" not in value or value.index("@") < value.index("=")):
             reference = value.split("@", 1)[1]
+        elif "=" in value:
+            key, cell = value.split("=", 1)
+            # curl encodes this value itself; its literal '+' is not a space.
+            result.inline_forms.append(key + "=" + quote(cell, safe=""))
     elif option not in {"--form-string", "--data-raw"} and value.startswith("@"):
         reference = value[1:]
     if reference in {"-", "."}:
@@ -62,6 +69,8 @@ def _payload(result: CommandFiles, option: str, value: str) -> None:
     elif option in {"--json", "--data", "-d", "--data-ascii", "--data-binary", "--data-raw"}:
         if option == "--json" or value.lstrip().startswith(("{", "[")):
             result.inline_json.append(value)
+        elif "=" in value:
+            result.inline_forms.append(value)
 
 
 def file_references(command: str) -> CommandFiles:
@@ -78,6 +87,8 @@ def file_references(command: str) -> CommandFiles:
                 raw = raw[1:-1]
             values.append(raw if re.match(r"[A-Za-z]:[\\/]", raw) else token.value)
         program = values[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if program in {"cd", "chdir", "pushd", "popd", "set-location", "sl"}:
+            result.changes_directory = True
         if program not in {"curl", "curl.exe"}:
             if program in {"wget", "wget.exe", "nc", "ncat", "netcat"}:
                 # These transports can read local bodies through grammars we

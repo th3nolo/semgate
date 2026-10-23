@@ -30,7 +30,8 @@ class SafeProvider(JudgeProvider):
             raise ProviderError(f"privacy: provider failed ({type(exc).__name__})") from None
 
 
-def for_envelope(provider: Any, envelope: Any, *, prepared: Any = None, offline_shell: bool = False) -> Any:
+def for_envelope(provider: Any, envelope: Any, *, prepared: Any = None, offline_shell: bool = False,
+                 execution_paths: Any = None) -> Any:
     """Seed auxiliary calls before they can classify task text remotely.
 
     Incomplete disclosure inspection disables these calls. The private offline
@@ -41,7 +42,8 @@ def for_envelope(provider: Any, envelope: Any, *, prepared: Any = None, offline_
         return None
     try:
         from ..privacyinspect import inspect
-        inspection = prepared.inspect(envelope) if prepared is not None else inspect(envelope)
+        view = execution_paths.envelope(envelope) if execution_paths is not None else envelope
+        inspection = prepared.inspect(view) if prepared is not None else inspect(view, execution_paths=execution_paths)
         return SafeProvider(provider, allow_calls=inspection.minimization_complete and (inspection.complete or offline_shell),
                             seed=inspection.cleaner, fixed_questions=True)
     except Exception:

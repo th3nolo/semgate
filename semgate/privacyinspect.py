@@ -8,10 +8,10 @@ from pathlib import Path
 import re
 import stat
 from typing import Any, Dict, List, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .envelope import Envelope
-from .privacydata import InputUnsafe, MAX_TEXT, Minimizer, json_value
+from .privacydata import InputUnsafe, MAX_NODES, MAX_TEXT, Minimizer, json_value
 
 MAX_FILE_BYTES = 262144
 MAX_FILES = 8
@@ -37,8 +37,10 @@ class Inspection:
     payloads: Dict[Path, bytes] = field(default_factory=dict, repr=False)
     minimization_complete: bool = True
 
-    def problem(self, code: str) -> None:
+    def problem(self, code: str, *, minimization_incomplete: bool = False) -> None:
         self.complete = False
+        if minimization_incomplete:
+            self.minimization_complete = False
         if code not in self.problems:
             self.problems.append(code)
 
@@ -100,7 +102,13 @@ def inspect_content(cleaner: Minimizer, content: str, content_format: str = "") 
         cleaner.clean(value)
 
 
-def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
+def inspect_form(cleaner: Minimizer, content: str) -> None:
+    """Decode actual form boundaries; retain every repeated field's value."""
+    for key, value in parse_qsl(content, keep_blank_values=True, max_num_fields=MAX_NODES):
+        cleaner.clean({key: value})
+
+
+def inspect(envelope: Envelope, *, follow_files: bool = True, execution_paths: Any = None) -> Inspection:
     result = Inspection()
     args = dict(envelope.action.arguments)
     text = json.dumps(args, ensure_ascii=False, default=str)
@@ -140,9 +148,13 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
         return result
     for match in _URL.finditer(text):
         try:
-            host = urlsplit(match.group()).hostname
+            url = urlsplit(match.group())
+            host = url.hostname
+            if url.query:
+                inspect_form(result.cleaner, url.query)
         except ValueError:
             host = None
+            result.problem("url_uninspectable", minimization_incomplete=True)
         if host and host not in result.destinations:
             result.destinations.append(host)
     for key in ("to", "recipient", "recipients"):
@@ -160,6 +172,8 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
     try:
         for content in command_files.inline_json:
             inspect_content(result.cleaner, content, "json")
+        for content in command_files.inline_forms:
+            inspect_form(result.cleaner, content)
     except (ValueError, UnicodeError, RecursionError):
         result.minimization_complete = False
         result.problem("inline_payload_uninspectable")
@@ -167,54 +181,61 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
     if follow_files:
         references.extend(command_files.references)
     for problem in command_files.problems:
-        result.problem(problem)
+        result.problem(problem, minimization_incomplete=True)
     # Non-curl tools retain conservative @file discovery. Curl has its own
     # grammar (an email or --form-string @value is not a file read).
     if follow_files and not re.search(r"(?i)\bcurl(?:\.exe)?\b", command):
         references.extend(next(g for g in m.groups() if g is not None) for m in _AT_FILE.finditer(command))
     references = list(dict.fromkeys(references))
+    if references and command_files.changes_directory:
+        # The inspector does not evaluate shell control flow or cwd state.
+        # Never claim completeness from a same-named original-cwd file.
+        result.problem("changed_working_directory", minimization_incomplete=True)
+        return result
     if len(references) > MAX_FILES:
-        result.problem("file_count_limit")
+        result.problem("file_count_limit", minimization_incomplete=True)
         return result
     root_text = envelope.environment.project_root
     for index, reference in enumerate(references):
         if not root_text:
-            result.problem("no_project_root")
+            result.problem("no_project_root", minimization_incomplete=True)
             continue
         if not reference or any(c in reference for c in ("$", "%", "*", "?")):
-            result.problem("dynamic_file_reference")
+            result.problem("dynamic_file_reference", minimization_incomplete=True)
             continue
         try:
-            root = Path(root_text).resolve(strict=True)
-            path = Path(reference)
-            if not path.is_absolute():
+            root = (execution_paths.project if execution_paths is not None else Path(root_text)).resolve(strict=True)
+            path = Path(execution_paths.host(reference, envelope.environment.cwd) if execution_paths is not None else reference)
+            if execution_paths is None and not path.is_absolute():
                 cwd = Path(envelope.environment.cwd or root)
                 path = cwd / path
             if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
-                result.problem("linked_file")
+                result.problem("linked_file", minimization_incomplete=True)
                 continue
             path = path.resolve(strict=True)
             path.relative_to(root)
             prefixes = envelope.grant.allowed_path_prefixes
+            if execution_paths is not None:
+                prefixes = tuple(execution_paths.host(prefix) for prefix in prefixes)
             if prefixes and not any(path == Path(prefix).resolve() or Path(prefix).resolve() in path.parents for prefix in prefixes):
-                result.problem("file_outside_grant")
+                result.problem("file_outside_grant", minimization_incomplete=True)
                 continue
             if path.suffix.lower() not in TEXT_FORMATS:
-                result.problem("unsupported_file_format")
+                result.problem("unsupported_file_format", minimization_incomplete=True)
                 continue
             before = path.stat()
             if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_FILE_BYTES:
-                result.problem("file_size_or_type")
+                result.problem("file_size_or_type", minimization_incomplete=True)
                 continue
             with path.open("rb") as stream:
                 data = stream.read(MAX_FILE_BYTES + 1)
             after = path.stat()
             if len(data) > MAX_FILE_BYTES or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                result.problem("file_changed_or_large")
+                result.problem("file_changed_or_large", minimization_incomplete=True)
                 continue
             content = data.decode("utf-8-sig")
             if "\x00" in content:
-                result.problem("binary_file")
+                result.problem("binary_file", minimization_incomplete=True)
                 continue
             try:
                 inspect_content(result.cleaner, content, path.suffix.lower().lstrip("."))
@@ -226,5 +247,5 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
             result.snapshots[path] = digest
             result.payloads[path] = data
         except (OSError, ValueError, InputUnsafe, UnicodeError, RecursionError):
-            result.problem("file_uninspectable")
+            result.problem("file_uninspectable", minimization_incomplete=True)
     return result

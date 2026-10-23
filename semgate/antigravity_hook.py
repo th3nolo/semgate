@@ -512,10 +512,16 @@ def _run_core(
     privacy_gate = privacy_from_config(config)
     if privacy_gate is not None and prepared_disclosure is not None:
         privacy_gate.consents = consent_store
+    if execution_paths is not None:
+        from .devworker import VerifiedOfflineFacts
+        from .workerpaths import WorkerPaths
+        if (not trusted_offline_shell or not isinstance(trusted_execution_facts, VerifiedOfflineFacts)
+                or not isinstance(execution_paths, WorkerPaths)):
+            raise ValueError("worker path mapping requires verified private execution")
     if privacy_gate is not None:
         from .providers.safe import for_envelope
         provider = for_envelope(provider, build_envelope(grant), prepared=prepared_disclosure,
-                                offline_shell=trusted_offline_shell)
+                                offline_shell=trusted_offline_shell, execution_paths=execution_paths)
     # Work kinds: the purpose Jev judges against is composed from every kind of
     # work the user has asked for this session (see profiles.py). The grant's
     # hard scope (forbidden patterns, expiry) is untouched; kinds may only add
@@ -527,12 +533,6 @@ def _run_core(
     grant, kinds, table = _profiles.resolve(grant, prof_cfg, session_id=session_id,
                                            messages=user_messages(), provider=provider, resolved=prepared_profiles)
     envelope = build_envelope(grant)
-    if execution_paths is not None:
-        from .devworker import VerifiedOfflineFacts
-        from .workerpaths import WorkerPaths
-        if (not trusted_offline_shell or not isinstance(trusted_execution_facts, VerifiedOfflineFacts)
-                or not isinstance(execution_paths, WorkerPaths)):
-            raise ValueError("worker path mapping requires verified private execution")
     from .sendclient import verified_invocation
     trusted_send_client = verified_invocation(envelope, config)
     # semgate's own earlier answers in this session, which the host shows as

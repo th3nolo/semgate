@@ -211,7 +211,7 @@ def judge(
             from .privacyinspect import inspect as inspect_privacy
             try:
                 privacy_inspection = (prepared_disclosure.inspect(envelope) if prepared_disclosure is not None
-                                      else inspect_privacy(envelope))
+                                      else inspect_privacy(envelope, execution_paths=execution_paths))
             except Exception:
                 pass  # apply() records an inspection error, never an allow
             privacy_result = privacy_gate.apply(envelope, Decision("allow"), inspection=privacy_inspection,
