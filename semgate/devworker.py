@@ -130,7 +130,11 @@ def audit_write_confinement(project: Path) -> dict:
     An entry that cannot be listed or stat'ed leaves the audit incomplete:
     listing a directory and writing inside it are different permissions, so an
     unreadable name can still be writable in the guest. Callers must refuse an
-    incomplete audit as well as a proven alias.
+    incomplete audit as well as a proven alias. Existing FIFOs, sockets and
+    devices cannot establish this boundary: a host peer can already hold the
+    same endpoint, even when it has only one project name. Refuse those entry
+    types before exposing the project to arbitrary guest code. Symlinks are
+    resolved within the guest mount namespace rather than followed here.
 
     The audit is a snapshot taken immediately before the command starts. The
     sandboxed agent cannot add an escaping name itself: link() to another
@@ -175,6 +179,8 @@ def audit_write_confinement(project: Path) -> dict:
                 counts[key] = counts.get(key, 0) + 1
                 links[key] = info.st_nlink
                 names.setdefault(key, []).append(os.path.relpath(entry.path, project))
+            elif not stat.S_ISLNK(info.st_mode):
+                unverifiable += 1
     offenders = []
     for key, number in counts.items():
         if number < links[key]:

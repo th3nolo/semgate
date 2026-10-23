@@ -390,7 +390,10 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
                            "stage": str(meta.get("judged_stage", "") or ""),
                            "judgment_id": str(meta.get("content_digest", "") or "")}
     env = built.get("envelope")
-    if env is not None and decision in ("allow", "ask") and not meta.get("privacy_blocked"):
+    # Unreadable evidence may hide a newer human denial. An older ordinary
+    # approval cannot authorize execution until that evidence is available.
+    if (env is not None and decision in ("allow", "ask") and not meta.get("privacy_blocked")
+            and out["stage"] != "store_unavailable"):
         out = _approval_step(out, env, config, req, meta, consume=consume_approval)
     out["reason"] = public_text(out["reason"])[:1000]
     return out

@@ -106,15 +106,22 @@ OPTIONAL_QUESTIONS = ("executes", "on_task", "instructed_by_context", "unneeded_
 
 def render_action(envelope: Envelope) -> str:
     """The text the provider judges. For shell tools it is the command line only;
-    for a URL fetch or a file read it is a plain description, so the judge does not
-    mistake a read-only GET for a file edit."""
+    for HTTP operations and file reads it describes their actual effects."""
     arguments = envelope.action.arguments
     command = arguments.get("command")
     if isinstance(command, str) and command.strip():
         return command.strip()
     url = arguments.get("url") or arguments.get("Url")
     if isinstance(url, str) and url.strip():
-        return f"read-only HTTP GET of the URL {url.strip()} (fetch and read a web page; no local file is changed)"
+        method = arguments.get("method", "GET")
+        method = method.strip().upper() if isinstance(method, str) else "UNKNOWN"
+        payload_bytes = arguments.get("payload_bytes")
+        has_payload = any(key in arguments for key in ("body", "data", "json")) or bool(payload_bytes)
+        if method in {"GET", "HEAD"} and not has_payload:
+            return f"read-only HTTP {method} of the URL {url.strip()} (fetch and read a web page; no local file is changed)"
+        payload = (f"uploads {payload_bytes} bytes" if type(payload_bytes) is int and payload_bytes >= 0
+                   else "may send data")
+        return f"HTTP {method or 'UNKNOWN'} to the URL {url.strip()} (outbound request; {payload}; may change remote state)"
     path = arguments.get("path")
     if isinstance(path, str) and path.strip() and envelope.action.tool in ("read", "view_file"):
         return f"read the file {path.strip()} (read-only; no file is changed)"
