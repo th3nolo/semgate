@@ -21,6 +21,7 @@ later calibration and (much later) any non-shadow behavior must be built on.
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -73,6 +74,43 @@ def _judgment_controls(record: Dict[str, Any]) -> tuple:
              for vote in decision.get("predicate_votes") or []])
 
 
+def _typed_metadata_slots(record: Dict[str, Any], digest: str, max_score: int) -> list:
+    """Generated IDs and bounded numeric votes are metadata, not card text.
+
+    Other strings still undergo ordinary detection. Even these slots must be
+    checked against private values discovered in the actual record data.
+    """
+    slots = []
+    decision = record["decision"]
+    if record.get("judgment_id") == decision.get("envelope_digest") == digest:
+        slots.extend([(("judgment_id",), digest), (("decision", "envelope_digest"), digest)])
+
+    def number(path, value, maximum=1):
+        if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= maximum:
+            slots.append((path, value))
+
+    number(("decision", "latency_ms"), decision.get("latency_ms"), math.inf)
+
+    for index, vote in enumerate(decision.get("predicate_votes") or []):
+        prefix = ("decision", "predicate_votes", index)
+        for field in ("p", "mean", "confidence"):
+            number((*prefix, field), vote.get(field))
+        # A valid score has no more levels than the bounded question structure.
+        number((*prefix, "value"), vote.get("value"), max_score)
+        probabilities = vote.get("probabilities")
+        if isinstance(probabilities, dict):
+            for key, value in probabilities.items():
+                number((*prefix, "probabilities", key), value)
+    return slots
+
+
+def _slot_parent(record: Dict[str, Any], path: tuple) -> tuple:
+    parent = record
+    for part in path[:-1]:
+        parent = parent[part]
+    return parent, path[-1]
+
+
 class Ledger:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -100,14 +138,14 @@ class Ledger:
             "envelope": envelope.to_dict(),
         }
         if private:
-            from .privacydata import safe_inputs
+            from .privacydata import Minimizer
             try:
                 record["decision"] = deepcopy(record["decision"])
                 private_turn = self._private_turn_id(record["envelope"])
                 from .feedback import _command_of, norm_root
                 from .trustauth import key_for_store
                 from .trust import inner_commands
-                from .privacydata import InputUnsafe, MAX_TEXT
+                from .privacydata import InputUnsafe, MAX_NODES, MAX_TEXT
                 key = key_for_store(self.path)
                 command = _command_of(envelope.action.arguments)
                 if len(command) > MAX_TEXT:
@@ -120,7 +158,12 @@ class Ledger:
                                   ("project", norm_root(envelope.environment.project_root or envelope.environment.cwd)))}
                 identities["privacy_trust_target_ids"] = [private_identity(key, "command", target)
                                                          for target in inner_commands(command)]
-                controls = _judgment_controls(record)
+                controls = deepcopy(_judgment_controls(record))
+                slots = _typed_metadata_slots(record, envelope.digest(), MAX_NODES)
+                for path, _ in slots:
+                    parent, field = _slot_parent(record, path)
+                    parent[field] = None
+                masked_controls = deepcopy(_judgment_controls(record))
                 privacy = record["decision"].get("evidence", {}).get("privacy", {})
                 counts = privacy.get("categories")
                 counter_rows = (isinstance(counts, dict) and all(isinstance(k, str) and type(v) is int and v >= 0
@@ -130,11 +173,26 @@ class Ledger:
                     # Keep their public mapping shape after sanitization, but
                     # do not teach the learner that email: 1 is an address.
                     privacy["categories"] = [{"category": k, "count": v} for k, v in counts.items()]
-                record, _ = safe_inputs(record, {}, seed=seed)
-                if _judgment_controls(record) != controls:
+                cleaner = deepcopy(seed) if seed is not None else Minimizer()
+                cleaner.nodes = 0
+                cleaner.clean(record)
+                cleaner.nodes = 0
+                record = cleaner.clean(record)
+                if _judgment_controls(record) != masked_controls:
                     # A private value can equal a stage, predicate, key or
                     # score. Never let its replacement hide an adverse vote
                     # as an unrelated record or an apparently empty window.
+                    raise InputUnsafe("private minimization changed history controls")
+                for path, value in slots:
+                    # Apply known private values without letting a generated
+                    # hash or a probability teach the card heuristic new PII.
+                    if cleaner.text(str(value), discover=False) != str(value):
+                        raise InputUnsafe("private value collides with typed history metadata")
+                    parent, field = _slot_parent(record, path)
+                    if field not in parent or parent[field] is not None:
+                        raise InputUnsafe("private minimization changed metadata structure")
+                    parent[field] = value
+                if _judgment_controls(record) != controls:
                     raise InputUnsafe("private minimization changed history controls")
                 if counter_rows:
                     privacy = record["decision"]["evidence"]["privacy"]

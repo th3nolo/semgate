@@ -281,7 +281,7 @@ class Minimizer:
             raise InputUnsafe("uninspectable structured text") from exc
         return value
 
-    def text(self, value: str) -> str:
+    def text(self, value: str, *, discover: bool = True) -> str:
         if len(value) > MAX_TEXT:
             raise InputUnsafe("privacy text limit exceeded")
         views = [(value, None)]
@@ -301,12 +301,13 @@ class Minimizer:
         else:
             if _PERCENT_BYTES.search(decoded) or _JSON_ESCAPE.search(decoded):
                 raise InputUnsafe("privacy decoding depth exceeded")
-        for text, _ in views:
-            for hit in find(text):
-                if hit.value not in self.values.values():
-                    self.remember(hit.category, hit.value)
-            for match in _HOME.finditer(text):
-                self.remember("home", match.group())
+        if discover:
+            for text, _ in views:
+                for hit in find(text):
+                    if hit.value not in self.values.values():
+                        self.remember(hit.category, hit.value)
+                for match in _HOME.finditer(text):
+                    self.remember("home", match.group())
         intervals = []
         for text, positions in views:
             for raw in sorted(self.values, key=len, reverse=True):

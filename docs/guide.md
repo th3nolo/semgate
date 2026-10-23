@@ -344,6 +344,11 @@ No live config, key or paid request is required to run
 `python -m pytest -q tests/test_privacy.py tests/test_privacy_enforcement.py`.
 
 Privacy-enabled judgment records are minimized before entering the ledger.
+Verified generated judgment hashes and typed numeric vote/latency fields do not
+teach the detector new PII values. They are still checked against private values
+found in the actual data before exact metadata is restored. A genuine collision,
+changed control structure or incomplete minimization still marks history incomplete;
+the ordinary text/card detector and approval rules remain unchanged.
 Other stores and host transcripts can still hold sensitive data; this is not
 comprehensive at-rest redaction. If minimized history cannot establish a
 session-drift window, the drift check abstains rather than silently dropping
