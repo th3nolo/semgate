@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 from typing import List
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from . import shellparse
 
@@ -44,13 +44,22 @@ def _payload(result: CommandFiles, option: str, value: str) -> None:
         if "=" not in value:
             result.problem("unsupported_form")
             return
-        part = value.split("=", 1)[1]
+        name, part = value.split("=", 1)
         if part.startswith(("@", "<")):
             reference = part[1:].split(";", 1)[0]
             if "," in reference or ";" in part:
                 result.problem("unsupported_form_attributes")
-        elif ";headers=" in part.lower():
+        elif any(c in part for c in ';"\\'):
             result.problem("unsupported_form_attributes")
+        else:
+            result.inline_forms.append(urlencode([(name, part)]))
+    elif option == "--form-string":
+        if "=" not in value:
+            result.problem("unsupported_form")
+            return
+        name, part = value.split("=", 1)
+        # Multipart strings are literal, including '@', '+', '&' and ';'.
+        result.inline_forms.append(urlencode([(name, part)]))
     elif option == "--data-urlencode":
         # curl's name@file form differs from name=value and literal content.
         if "@" in value and ("=" not in value or value.index("@") < value.index("=")):

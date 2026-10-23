@@ -853,6 +853,10 @@ preserve reads. The bootstrap refuses known overlapping paths and resolved
 aliases before agent execution; it does not move or rewrite host state.
 This placement check also applies when a project itself is under a shared
 runtime tree. Use an unexposed installation/state location for that profile.
+Known authority files and private-store files are also checked by inode for
+hard-link aliases in readable directory views. Ordinary read-only aliases of
+unrelated public source files remain supported; an incomplete check refuses
+the profile rather than claiming authority is hidden.
 
 Conventional linked Git worktrees retain read-only Git inspection. The broker
 resolves the worktree's metadata and common repository directory, then supplies

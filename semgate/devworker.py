@@ -55,7 +55,64 @@ def _system_sources() -> tuple[Path, ...]:
     return tuple(Path(name) for name in _SYSTEM_BINDS if Path(name).exists())
 
 
-def _require_hidden_authority(authority: list[str], sources: tuple[Path, ...]) -> None:
+def _authority_identities(authority) -> frozenset[tuple[int, int]]:
+    """Collect the known file identities needed for hard-link checks."""
+    identities, directories = set(), set()
+    pending = [Path(name).expanduser().resolve() for name in authority]
+    try:
+        while pending:
+            path = pending.pop()
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                continue  # future state/key paths are still checked by name
+            identity = (info.st_dev, info.st_ino)
+            if stat.S_ISDIR(info.st_mode):
+                if identity in directories:
+                    continue
+                directories.add(identity)
+                with os.scandir(path) as entries:
+                    pending.extend(Path(entry.path).resolve() for entry in entries)
+            elif info.st_nlink > 1:
+                identities.add(identity)
+            elif info.st_nlink < 1:
+                raise ValueError("operator authority link identity could not be verified")
+    except OSError:
+        raise ValueError("operator authority identity could not be verified") from None
+    return frozenset(identities)
+
+
+def _reject_readable_aliases(identities, sources) -> None:
+    if not identities:
+        return
+    pending, directories = list(sources), set()
+    try:
+        while pending:
+            source = pending.pop()
+            info = source.stat()
+            identity = (info.st_dev, info.st_ino)
+            if not stat.S_ISDIR(info.st_mode):
+                if identity in identities:
+                    raise ValueError("operator authority aliases a readable worker mount")
+                continue
+            if identity in directories:
+                continue
+            directories.add(identity)
+            with os.scandir(source) as entries:
+                for entry in entries:
+                    child = os.lstat(entry.path)
+                    if stat.S_ISDIR(child.st_mode) and not _is_name_surrogate(child):
+                        pending.append(Path(entry.path))
+                    elif not stat.S_ISLNK(child.st_mode) and (child.st_dev, child.st_ino) in identities:
+                        raise ValueError("operator authority aliases a readable worker directory")
+            # Nested symbolic paths resolve in the guest namespace. Any
+            # readable target belongs to another mounted source/view, which
+            # is checked separately; do not walk an unmounted host target.
+    except OSError:
+        raise ValueError("operator authority alias visibility could not be verified") from None
+
+
+def _require_hidden_authority(authority: list[str], sources: tuple[Path, ...], *, identities=None):
     """A read-only source is still readable; refuse known authority overlap."""
     try:
         for name in authority:
@@ -69,6 +126,9 @@ def _require_hidden_authority(authority: list[str], sources: tuple[Path, ...]) -
                     raise ValueError("operator authority aliases a readable worker mount")
     except OSError:
         raise ValueError("operator authority visibility could not be verified") from None
+    identities = _authority_identities(authority) if identities is None else identities
+    _reject_readable_aliases(identities, sources)
+    return identities
 
 
 def _reserve_metadata(project: Path) -> None:
@@ -141,7 +201,8 @@ class IncompleteAuditError(WriteConfinementError):
 
 
 def audit_write_confinement(project: Path, *, read_only: bool = False,
-                            masked_roots: frozenset[str] = frozenset(_METADATA_NAMES)) -> dict:
+                            masked_roots: frozenset[str] = frozenset(_METADATA_NAMES),
+                            authority_ids: frozenset[tuple[int, int]] = frozenset()) -> dict:
     """Fail closed when a writable project file shares its file with a name outside it.
 
     A hard link is a second directory entry for one file, so it crosses the
@@ -179,6 +240,7 @@ def audit_write_confinement(project: Path, *, read_only: bool = False,
     checked = 0
     unverifiable = 0
     surrogates: list[str] = []
+    authority_aliases = []
     stack = [(project, True, not read_only)]
     while stack:
         current, is_root, writable = stack.pop()
@@ -199,6 +261,8 @@ def audit_write_confinement(project: Path, *, read_only: bool = False,
             except OSError:
                 unverifiable += 1
                 continue
+            if not stat.S_ISLNK(info.st_mode) and (info.st_dev, info.st_ino) in authority_ids:
+                authority_aliases.append(os.path.relpath(entry.path, project))
             if stat.S_ISDIR(info.st_mode):
                 if _is_name_surrogate(info):
                     surrogates.append(os.path.relpath(entry.path, project))
@@ -217,8 +281,11 @@ def audit_write_confinement(project: Path, *, read_only: bool = False,
         if number < links[key]:
             offenders.append({"paths": sorted(names[key])[:4], "names_in_view": number,
                               "link_count": links[key]})
-    return {"checked": checked, "inodes": len(counts), "unverifiable": unverifiable,
-            "offenders": offenders[:8], "surrogates": sorted(surrogates)[:8]}
+    result = {"checked": checked, "inodes": len(counts), "unverifiable": unverifiable,
+              "offenders": offenders[:8], "surrogates": sorted(surrogates)[:8]}
+    if authority_ids:
+        result["authority_aliases"] = sorted(authority_aliases)[:8]
+    return result
 
 
 def validate_write(arguments: dict) -> dict:
@@ -428,6 +495,17 @@ class OfflineWorker:
             if audit["unverifiable"]:
                 raise IncompleteAuditError(audit)
         git_layout = workerrepo.layout(project_path, protected)
+        authority_ids = _authority_identities(protected)
+        if authority_ids:
+            privacy_audit = audit_write_confinement(project_path, read_only=True, authority_ids=authority_ids)
+            if privacy_audit.get("authority_aliases"):
+                raise ValueError("operator authority has a readable project alias")
+            if privacy_audit["unverifiable"]:
+                raise IncompleteAuditError(privacy_audit)
+        metadata = tuple(project_path / name for name in (".git", ".venv") if (project_path / name).exists())
+        if git_layout is not None:
+            metadata += (Path(git_layout["common"]),)
+        _require_hidden_authority(list(protected), metadata, identities=authority_ids)
         if self.settings["backend"] == "wsl-bubblewrap":
             launcher = str(Path(os.environ["SystemRoot"]) / "System32/wsl.exe")
             running = proc.run([launcher, "--list", "--running", "--quiet"], timeout=10,
@@ -565,9 +643,15 @@ def execute(payload: dict) -> dict:
     system_sources = _system_sources()
     authority = list(dict.fromkeys([*payload.get("authority", []),
                                    *(str(project / p) for p in payload["protected"])]))
-    exposed_sources = (*system_sources, *(Path(p) for p in payload["tools"].values()),
-                       *(project / name for name in (".git", ".venv") if (project / name).exists()))
-    _require_hidden_authority(authority, exposed_sources)
+    exposed_sources = (*(project / name for name in (".git", ".venv") if (project / name).exists()),
+                       *(Path(p) for p in payload["tools"].values()), *system_sources)
+    authority_ids = _require_hidden_authority(authority, exposed_sources)
+    if authority_ids:
+        privacy_audit = audit_write_confinement(project, read_only=True, authority_ids=authority_ids)
+        if privacy_audit.get("authority_aliases"):
+            raise ValueError("operator authority has a readable project alias")
+        if privacy_audit["unverifiable"]:
+            raise IncompleteAuditError(privacy_audit)
     # DrvFS case aliases can bypass a mount covering .semgate or .git. Test
     # the actual project directory, not a child that may inherit other flags.
     import tempfile
@@ -594,7 +678,7 @@ def execute(payload: dict) -> dict:
         git_layout = workerrepo.layout(project, tuple(str(project / p) for p in payload["protected"]))
     if git_layout is not None:
         git_layout = workerrepo.validate(project, git_layout)
-        _require_hidden_authority(authority, (Path(git_layout["common"]),))
+        _require_hidden_authority(authority, (Path(git_layout["common"]),), identities=authority_ids)
         metadata_audit = audit_write_confinement(Path(git_layout["common"]), read_only=True, masked_roots=frozenset())
         if metadata_audit["unverifiable"]:
             raise IncompleteAuditError(metadata_audit)

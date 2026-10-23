@@ -107,14 +107,24 @@ def find(text: str) -> List[Finding]:
         if value:
             start = match.start("value") + len(match.group("value")) - len(match.group("value").lstrip())
             found.append(Finding(FIELDS[match.group("key").lower()], value, start, start + len(value)))
-    # secretfinder has its own scan cap. Overlapping bounded windows cover the
-    # whole permitted input instead of silently missing its tail.
-    for offset in range(0, len(text), 16000):
-        chunk = text[max(0, offset - 2048):offset + 18048]
-        for hit in secretfinder.find(chunk):
-            start = text.find(hit.value, max(0, offset - 2048))
-            if start >= 0:
-                found.append(Finding("secret", hit.value, start, start + len(hit.value)))
+    # This layer's text bound is below the detector's scan bound. Preserve
+    # source spans: a normalized PEM body is not contiguous in wrapped input.
+    # The public detector deduplicates values; keep every PEM occurrence so
+    # different wrapping of the same body is also removed.
+    if len(text) > secretfinder.MAX_SCAN:
+        raise InputUnsafe("privacy secret scan limit exceeded")
+    if sum(1 for _ in secretfinder._PEM_BEGIN.finditer(text)) > secretfinder.PEM_MAX_BLOCKS:
+        raise InputUnsafe("privacy PEM block limit exceeded")
+    for hit in secretfinder._pem(text):
+        begin = secretfinder._PEM_BEGIN.match(text, hit.start)
+        marker = "-----END " + begin.group(1) + "-----"
+        if (hit.end == begin.end() + secretfinder.PEM_MAX_BODY and hit.end < len(text)
+                and not text[hit.start:hit.end].endswith(marker)):
+            raise InputUnsafe("privacy PEM body limit exceeded")
+        found.append(Finding("secret", hit.value, hit.start, hit.end))
+    for hit in secretfinder.find(text):
+        if hit.type != "PEM private key":
+            found.append(Finding("secret", hit.value, hit.start, hit.end))
     unique = {(hit.category, hit.start, hit.end): hit for hit in found}
     return sorted(unique.values(), key=lambda hit: (hit.start, -len(hit.value), hit.category))
 
@@ -185,6 +195,53 @@ class Minimizer:
         if value not in self.values:
             self.values[value] = f"<PRIVATE_{category.upper()}_{self.counts[category]}>"
         return self.values[value]
+
+    def _remember_secret_field(self, value: str, key: str) -> bool:
+        normalized = _field_key(key)
+        if (secretfinder.quoted_name(normalized) and (secretfinder.quoted_value(value)
+                or secretfinder.secret_name(normalized) and secretfinder.secret_value(value, normalized, True))):
+            self.remember("secret", value)
+            return True
+        return False
+
+    def _learn_secret_tree(self, value: Any, key: str, depth: int) -> None:
+        """Apply the existing labeled-secret predicate to structured leaves."""
+        self.nodes += 1
+        if self.nodes > MAX_NODES or depth > MAX_DEPTH:
+            raise InputUnsafe("privacy structure limit exceeded")
+        if isinstance(value, Mapping):
+            for cell in value.values():
+                self._learn_secret_tree(cell, key, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for cell in value:
+                self._learn_secret_tree(cell, key, depth + 1)
+        elif isinstance(value, str):
+            if len(value) > MAX_TEXT:
+                raise InputUnsafe("privacy text limit exceeded")
+            self._remember_secret_field(value, key)
+            if value.lstrip().startswith(("{", "[")):
+                try:
+                    parsed = json_value(value)
+                except json.JSONDecodeError:
+                    pass  # a regex/example string need not be a JSON container
+                else:
+                    self._learn_secret_tree(parsed, key, depth + 1)
+            if "=" in value and all(re.fullmatch(r"[A-Za-z0-9_.%+\[\]-]{1,256}=[\s\S]*", part)
+                                    for part in value.split("&")):
+                for _, cell in parse_qsl(value, keep_blank_values=True, max_num_fields=MAX_NODES):
+                    self._learn_secret_tree(cell, key, depth + 1)
+            first = value.splitlines()[0] if value.splitlines() else ""
+            if ("\n" in value or "\r" in value) and ("," in first or "\t" in first):
+                try:
+                    for row in csv.reader(io.StringIO(value), delimiter="\t" if "\t" in first else ",", strict=True):
+                        for cell in row:
+                            self._learn_secret_tree(cell, key, depth + 1)
+                except csv.Error as exc:
+                    raise InputUnsafe("uninspectable secret-field table") from exc
+            if _PERCENT_BYTES.search(value):
+                decoded = unquote_plus(value)
+                if decoded != value:
+                    self._learn_secret_tree(decoded, key, depth + 1)
 
     def _structured_text(self, value: str, depth: int) -> str:
         """Sanitize parsed containers, preserving surrounding unstructured text."""
@@ -305,7 +362,13 @@ class Minimizer:
             for text, _ in views:
                 for hit in find(text):
                     if hit.value not in self.values.values():
-                        self.remember(hit.category, hit.value)
+                        placeholder = self.remember(hit.category, hit.value)
+                        raw = text[hit.start:hit.end]
+                        if raw != hit.value:
+                            # Retain formatting aliases as well as normalized
+                            # referents; interval replacement needs source text.
+                            self.values.setdefault(raw, placeholder)
+                            self.categories.setdefault(raw, set()).add(hit.category)
                 for match in _HOME.finditer(text):
                     self.remember("home", match.group())
         intervals = []
@@ -335,6 +398,8 @@ class Minimizer:
         self.nodes += 1
         if self.nodes > MAX_NODES or depth > MAX_DEPTH:
             raise InputUnsafe("privacy structure limit exceeded")
+        if secretfinder.quoted_name(_field_key(key)):
+            self._learn_secret_tree(value, key, depth)
         structured = self._structured_text(value, depth) if isinstance(value, str) else None
         category = FIELDS.get(_field_key(key))
         if category and value is not None and not isinstance(value, (Mapping, list, tuple)):
@@ -355,10 +420,7 @@ class Minimizer:
                 raise InputUnsafe("privacy text limit exceeded")
             # Preserve the assignment context used by the existing detector;
             # a generic credential need not have a vendor-specific prefix.
-            normalized_key = _field_key(key)
-            if (secretfinder.quoted_name(normalized_key) and (secretfinder.quoted_value(value)
-                    or secretfinder.secret_name(normalized_key) and secretfinder.secret_value(value, normalized_key, True))):
-                self.remember("secret", value)
+            if self._remember_secret_field(value, key):
                 return self.text(value)
             return self.text(structured)
         if isinstance(value, Mapping):
