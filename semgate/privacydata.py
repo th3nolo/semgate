@@ -362,7 +362,17 @@ class Minimizer:
                 return self.text(value)
             return self.text(structured)
         if isinstance(value, Mapping):
-            return {self.text(str(k)): self.clean(v, key=str(k), depth=depth + 1) for k, v in value.items()}
+            cleaned = {}
+            for k, v in value.items():
+                name = str(k)
+                # Unknown component keys (given/family, street/city, etc.)
+                # retain the enclosing sensitive label. A recognized child
+                # label still supplies its own category, including secrets.
+                if category and isinstance(v, str) and secretfinder.quoted_name(_field_key(name)):
+                    self.clean(v, key=name, depth=depth + 1)
+                context = name if not category or _field_key(name) in FIELDS else key
+                cleaned[self.text(name)] = self.clean(v, key=context, depth=depth + 1)
+            return cleaned
         if isinstance(value, (list, tuple)):
             return [self.clean(v, key=key, depth=depth + 1) for v in value]
         if value is None or isinstance(value, bool):

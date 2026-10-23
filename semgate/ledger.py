@@ -218,13 +218,11 @@ class Ledger:
                           "envelope": {"environment": {"session_id": ""}},
                           "decision": {"decision": decision.decision, "stage": decision.stage,
                                        "reason_code": decision.reason_code}}
-                from .privacydata import Minimizer
-                try:
-                    record["envelope"]["environment"]["session_id"] = Minimizer().text(envelope.environment.session_id)
-                except Exception:
-                    pass
-                if record["envelope"]["environment"]["session_id"] != envelope.environment.session_id:
-                    record["privacy_session_unattributed"] = True
+                # A fresh discovery pass loses known values; even reusing the
+                # failed cleaner may overflow. Keep fallback unattributed so
+                # neither private identity nor apparently complete history
+                # can be reconstructed after minimization fails.
+                record["privacy_session_unattributed"] = True
         self._append(record)
         return decision.envelope_digest
 

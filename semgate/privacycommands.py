@@ -29,6 +29,7 @@ class CommandFiles:
     inline_json: List[str] = field(default_factory=list)
     inline_forms: List[str] = field(default_factory=list)
     changes_directory: bool = False
+    compound: bool = False
 
     def problem(self, code: str) -> None:
         if code not in self.problems:
@@ -75,7 +76,9 @@ def _payload(result: CommandFiles, option: str, value: str) -> None:
 
 def file_references(command: str) -> CommandFiles:
     result = CommandFiles()
-    for simple in shellparse.split_commands(command):
+    commands = shellparse.split_commands(command)
+    result.compound = len(commands) > 1
+    for simple in commands:
         tokens = shellparse.effective_argv(simple.tokens)
         if not tokens:
             continue
@@ -90,6 +93,12 @@ def file_references(command: str) -> CommandFiles:
         if program in {"cd", "chdir", "pushd", "popd", "set-location", "sl"}:
             result.changes_directory = True
         if program not in {"curl", "curl.exe"}:
+            if program not in shellparse.DATA_COMMANDS and any(
+                    value.replace("\\", "/").rsplit("/", 1)[-1].strip("(){}").lower() in {"curl", "curl.exe"}
+                    for value in values):
+                # Control syntax and wrappers outside the supported argv
+                # grammar cannot silently become a complete empty payload.
+                result.problem("unsupported_curl_context")
             if program in {"wget", "wget.exe", "nc", "ncat", "netcat"}:
                 # These transports can read local bodies through grammars we
                 # do not inspect. An empty finding set is not completeness.

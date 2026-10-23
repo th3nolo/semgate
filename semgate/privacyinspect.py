@@ -119,7 +119,7 @@ def inspect(envelope: Envelope, *, follow_files: bool = True, execution_paths: A
     # reading of arbitrary scripts: mark this first implementation incomplete.
     if _OPAQUE.search(command):
         result.outgoing = True
-        result.problem("opaque_program")
+        result.problem("opaque_program", minimization_incomplete=bool(_NETWORK.search(command) and _AT_FILE.search(command)))
     # A literal local write does not disclose its bytes, but its permission
     # evaluator still needs sanitized structured input before any model call.
     content = args.get("content")
@@ -187,9 +187,10 @@ def inspect(envelope: Envelope, *, follow_files: bool = True, execution_paths: A
     if follow_files and not re.search(r"(?i)\bcurl(?:\.exe)?\b", command):
         references.extend(next(g for g in m.groups() if g is not None) for m in _AT_FILE.finditer(command))
     references = list(dict.fromkeys(references))
-    if references and command_files.changes_directory:
+    if references and (command_files.changes_directory or command_files.compound):
         # The inspector does not evaluate shell control flow or cwd state.
-        # Never claim completeness from a same-named original-cwd file.
+        # Even an earlier helper can change the cwd in the same shell. Only
+        # a supported single invocation can bind the original-cwd file.
         result.problem("changed_working_directory", minimization_incomplete=True)
         return result
     if len(references) > MAX_FILES:
