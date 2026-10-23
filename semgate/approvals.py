@@ -88,16 +88,37 @@ class ApprovalStore:
     # ---------- file ----------
     def _load(self, now: float) -> Dict[str, Dict[str, Any]]:
         import json
+        import math
+        def unique(pairs):
+            out = {}
+            for key, value in pairs:
+                if key in out:
+                    raise ValueError("duplicate approval-store field")
+                out[key] = value
+            return out
+        def timestamp(value):
+            try:
+                return type(value) in (int, float) and math.isfinite(value)
+            except OverflowError:
+                return False
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8"), object_pairs_hook=unique)
         except FileNotFoundError:
             return {}
-        except (OSError, ValueError):
-            import sys
-            print(f"semgate: {self.path} did not parse; approvals restart empty", file=sys.stderr)
-            return {}
-        items = raw.get("approvals") if isinstance(raw, dict) and isinstance(raw.get("approvals"), dict) else {}
-        return {k: v for k, v in items.items() if isinstance(v, dict) and not self._expired(v, now)}
+        except (OSError, ValueError) as exc:
+            raise ApprovalError("approval store cannot be read", "unreadable") from exc
+        if (not isinstance(raw, dict) or type(raw.get("schema")) is not int or raw["schema"] != SCHEMA
+                or not isinstance(raw.get("approvals"), dict)):
+            raise ApprovalError("approval store has an invalid schema", "unreadable")
+        items = raw["approvals"]
+        if any(not _valid_id(k) or not isinstance(v, dict) or v.get("approval_id") != k
+               or v.get("status") not in {"pending", "approved", "denied", "used"}
+               or not timestamp(v.get("created"))
+               or v.get("status") in {"approved", "denied"} and not timestamp(v.get("decided"))
+               or not all(isinstance(v.get(field), str) and v[field] for field in ("action_key", "session_id", "project_root"))
+               for k, v in items.items()):
+            raise ApprovalError("approval store has an invalid record", "unreadable")
+        return {k: v for k, v in items.items() if not self._expired(v, now)}
 
     def _save(self, items: Mapping[str, Any]) -> None:
         if len(items) > MAX_RECORDS:

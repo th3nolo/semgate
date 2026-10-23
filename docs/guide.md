@@ -846,6 +846,15 @@ execution guard still apply, so a low-confidence decision can require review.
 PreparedSender still checks the exact snapshot, classification contract and
 current consent immediately before sending; worker facts cannot bypass it.
 
+Conventional linked Git worktrees retain read-only Git inspection. The broker
+resolves the worktree's metadata and common repository directory, then supplies
+guest-valid `.git`, `commondir`, and optional per-worktree configuration views.
+The main checkout's source directory is not mounted. Existing host pointers and
+configuration files are never repaired or rewritten. Operator authority inside
+shared Git metadata is refused, and exposed metadata is checked for special
+endpoints. Other external Git-pointer and alternate-object-store layouts are
+not part of this mapping and are refused before reporting a usable profile.
+
 The app-server contract is experimental, so the runner accepts only the locally
 validated Codex **0.153.1**. Other versions stop before starting an agent; validate
 and deliberately update the pin before adopting another release. A broken

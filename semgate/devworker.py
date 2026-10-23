@@ -18,6 +18,7 @@ if __package__:
     from . import proc
     from . import cachecleanup
     from . import readonlyscript
+    from . import workerrepo
 else:
     # The -I Linux bootstrap must not import the package (and its SDK) or
     # resolve project modules. Load only the adjacent trusted stdlib wrapper.
@@ -33,6 +34,9 @@ else:
     readonlyscript = importlib.util.module_from_spec(_script_spec)
     sys.modules[_script_spec.name] = readonlyscript
     _script_spec.loader.exec_module(readonlyscript)
+    _repo_spec = importlib.util.spec_from_file_location("semgate_worker_repo", Path(__file__).with_name("workerrepo.py"))
+    workerrepo = importlib.util.module_from_spec(_repo_spec)
+    _repo_spec.loader.exec_module(workerrepo)
 
 MAX_COMMAND = 4096
 MAX_OUTPUT = 16384
@@ -42,6 +46,7 @@ MAX_OUTPUT = 16384
 # writable directory in the guest, so its files stay inside the audited view.
 PROTECTED_PROJECT_NAMES = frozenset({".semgate", ".codex", ".agents", ".git", ".venv"})
 _METADATA_NAMES = (".semgate", ".codex", ".agents")
+_READ_ONLY_PROJECT_NAMES = PROTECTED_PROJECT_NAMES - frozenset(_METADATA_NAMES)
 
 
 def _reserve_metadata(project: Path) -> None:
@@ -113,7 +118,8 @@ class IncompleteAuditError(WriteConfinementError):
                 f"checked ({self.audit.get('checked', 0)} file(s) checked)")
 
 
-def audit_write_confinement(project: Path) -> dict:
+def audit_write_confinement(project: Path, *, read_only: bool = False,
+                            masked_roots: frozenset[str] = frozenset(_METADATA_NAMES)) -> dict:
     """Fail closed when a writable project file shares its file with a name outside it.
 
     A hard link is a second directory entry for one file, so it crosses the
@@ -135,6 +141,8 @@ def audit_write_confinement(project: Path) -> dict:
     same endpoint, even when it has only one project name. Refuse those entry
     types before exposing the project to arbitrary guest code. Symlinks are
     resolved within the guest mount namespace rather than followed here.
+    Read-only metadata skips alias counting, but still needs the endpoint
+    check: a read-only mount does not isolate a pre-existing IPC inode.
 
     The audit is a snapshot taken immediately before the command starts. The
     sandboxed agent cannot add an escaping name itself: link() to another
@@ -149,18 +157,19 @@ def audit_write_confinement(project: Path) -> dict:
     checked = 0
     unverifiable = 0
     surrogates: list[str] = []
-    stack = [(project, True)]
+    stack = [(project, True, not read_only)]
     while stack:
-        current, is_root = stack.pop()
+        current, is_root, writable = stack.pop()
         try:
             entries = list(os.scandir(current))
         except OSError:
             unverifiable += 1
             continue
         for entry in entries:
-            if is_root and entry.name in PROTECTED_PROJECT_NAMES:
+            if is_root and entry.name in masked_roots:
                 # The mount plan masks these project-root names only.
                 continue
+            entry_writable = writable and not (is_root and entry.name in _READ_ONLY_PROJECT_NAMES)
             try:
                 # os.lstat, not the cached directory entry: on Windows the
                 # directory entry carries no file index or link count.
@@ -172,14 +181,14 @@ def audit_write_confinement(project: Path) -> dict:
                 if _is_name_surrogate(info):
                     surrogates.append(os.path.relpath(entry.path, project))
                     continue
-                stack.append((entry.path, False))
-            elif stat.S_ISREG(info.st_mode):
+                stack.append((entry.path, False, entry_writable))
+            elif stat.S_ISREG(info.st_mode) and entry_writable:
                 key = (info.st_dev, info.st_ino)
                 checked += 1
                 counts[key] = counts.get(key, 0) + 1
                 links[key] = info.st_nlink
                 names.setdefault(key, []).append(os.path.relpath(entry.path, project))
-            elif not stat.S_ISLNK(info.st_mode):
+            elif not stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                 unverifiable += 1
     offenders = []
     for key, number in counts.items():
@@ -385,17 +394,18 @@ class OfflineWorker:
         worker_path = Path(__file__).resolve()
         if worker_path.is_relative_to(project_path):
             raise ValueError("the trusted Semgate installation must be outside the writable project")
-        if "command" in operation and check_confinement:
+        if check_confinement and ("command" in operation or "script_snapshot" in operation):
             # An ordinary command may write in place. Refuse before execution
             # when the writable project view shares a file with a name outside
             # the workspace (a hard link crosses the mount boundary), and when
             # the audit could not complete: an unchecked name may still be
             # writable in the guest.
-            audit = audit_write_confinement(project_path)
+            audit = audit_write_confinement(project_path, read_only="script_snapshot" in operation)
             if audit["offenders"]:
                 raise AliasAuditError(audit)
             if audit["unverifiable"]:
                 raise IncompleteAuditError(audit)
+        git_layout = workerrepo.layout(project_path, protected)
         if self.settings["backend"] == "wsl-bubblewrap":
             launcher = str(Path(os.environ["SystemRoot"]) / "System32/wsl.exe")
             running = proc.run([launcher, "--list", "--running", "--quiet"], timeout=10,
@@ -415,6 +425,8 @@ class OfflineWorker:
                 return proc.run(prefix + ["/usr/bin/wslpath", "-u", str(path)], timeout=10,
                                 text=True, capture_output=True, check=True).stdout.strip()
             project_name, entry = linux_path(project_path), linux_path(worker_path)
+            if git_layout is not None:
+                git_layout = dict(git_layout, common=linux_path(Path(git_layout["common"])))
             argv = prefix + ["/usr/bin/python3", "-I", entry]
         else:
             project_name = str(project_path)
@@ -429,6 +441,8 @@ class OfflineWorker:
                    "bubblewrap": self.settings.get("bubblewrap", "/usr/bin/bwrap"),
                    "bubblewrap_sha256": (expected_facts.launcher_sha256 if expected_facts is not None
                                          else self.settings.get("bubblewrap_sha256"))}
+        if git_layout is not None:
+            payload["git_layout"] = git_layout
         # Only the trusted bootstrap sees the host environment. bubblewrap
         # clears the guest environment and exposes no home or host /run.
         result = proc.run(argv, input=json.dumps(payload).encode(), capture_output=True, timeout=self.timeout + 20)
@@ -530,6 +544,14 @@ def execute(payload: dict) -> dict:
         if inspecting and readonlyscript.invocation("python3 " + str(payload["inspect_script"])) != payload["inspect_script"]:
             raise ValueError("invalid isolated source path")
     read_only = snapshot is not None or inspecting
+    git_layout = payload.get("git_layout")
+    if git_layout is None:
+        git_layout = workerrepo.layout(project, tuple(str(project / p) for p in payload["protected"]))
+    if git_layout is not None:
+        git_layout = workerrepo.validate(project, git_layout)
+        metadata_audit = audit_write_confinement(Path(git_layout["common"]), read_only=True, masked_roots=frozenset())
+        if metadata_audit["unverifiable"]:
+            raise IncompleteAuditError(metadata_audit)
     if cleanup:
         if cachecleanup.parse(payload["cache_cleanup"]) is None or "command" in payload or "write" in payload:
             raise ValueError("invalid cache cleanup operation")
@@ -551,7 +573,7 @@ def execute(payload: dict) -> dict:
         if cleanup and name == ".semgate":
             continue
         argv += ["--tmpfs", "/workspace/" + name, "--remount-ro", "/workspace/" + name]
-    if (project / ".git").exists():
+    if git_layout is None and (project / ".git").exists():
         argv += ["--ro-bind", str(project / ".git"), "/workspace/.git"]
     if (project / ".venv").exists():
         argv += ["--ro-bind", str(project / ".venv"), "/workspace/.venv"]
@@ -577,6 +599,8 @@ def execute(payload: dict) -> dict:
     from contextlib import ExitStack
     with _filter_file() as filter_file, ExitStack() as resources:
         inherited = [filter_file.fileno()]
+        if git_layout is not None:
+            argv += workerrepo.bind_arguments(git_layout, resources, inherited)
         if snapshot is not None:
             import fcntl
             fd = os.memfd_create("semgate-reviewed-source", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)

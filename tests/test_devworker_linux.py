@@ -61,6 +61,39 @@ class TestOfflineBoundary(unittest.TestCase):
             worker.execute(payload)
         self.assertFalse((self.root/"must-not-exist").exists())
 
+    def test_linked_worktree_git_reads_use_readonly_guest_metadata(self):
+        main = self.root / "main"
+        main.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        def git(path, *args):
+            return subprocess.run(["git", "-c", "user.name=Synthetic", "-c", "user.email=test@example.test",
+                "-c", "commit.gpgsign=false", "-C", str(path), *args], env=env, check=True,
+                capture_output=True, text=True, timeout=20).stdout
+        git(main, "init", "--template=")
+        (main / "report.csv").write_text("status\nready\n")
+        git(main, "add", "report.csv")
+        git(main, "commit", "-qm", "fixture")
+        git(main, "config", "extensions.worktreeConfig", "true")
+        for relative in (False, True):
+            with self.subTest(relative=relative):
+                project = self.root / ("relative" if relative else "absolute")
+                git(main, "worktree", "add", "--detach", *(["--relative-paths"] if relative else []), str(project), "HEAD")
+                git(project, "config", "--worktree", "core.worktree", str(project))
+                pointer_before = (project / ".git").read_bytes()
+                config_before = (main / ".git/config").read_bytes()
+                (project / "report.csv").write_text("status\nchanged\n")
+                result = worker.execute({"project":str(project), "command":
+                    "git status --porcelain && git diff -- report.csv && test ! -e /workspace/../main/report.csv && ! touch /semgate-git/config",
+                    "timeout_s":5,"tools":{},"protected":[],
+                    "bubblewrap":os.environ.get("SEMGATE_TEST_BWRAP","/usr/bin/bwrap"),
+                    "bubblewrap_sha256":os.environ.get("SEMGATE_TEST_BWRAP_SHA256")})
+                self.assertEqual(result["exit_code"], 0, result)
+                self.assertIn("M report.csv", result["stdout"])
+                self.assertIn("+changed", result["stdout"])
+                self.assertEqual((project / ".git").read_bytes(), pointer_before)
+                self.assertEqual((main / ".git/config").read_bytes(), config_before)
+
     def test_preflight_uses_real_kernel_boundary_before_reporting_facts(self):
         instance = worker.OfflineWorker({"backend":"bubblewrap", "timeout_s":5,
             "bubblewrap":os.environ.get("SEMGATE_TEST_BWRAP", "/usr/bin/bwrap"),
