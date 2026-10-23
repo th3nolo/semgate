@@ -606,8 +606,10 @@ before every job and refuses case-insensitive DrvFS directories: a spelling such
 as `.SeMgAtE` could otherwise evade a mount hiding `.semgate`. Use a case-sensitive
 workspace provisioned by the operator; this feature never changes its filesystem
 flag. Operator config, policy, grants and client/consent state must be outside
-the writable project or within its exact `.semgate`, `.codex`, `.agents` or
-`.git` top-level trees. The trusted Semgate installation must be outside it.
+the writable project or within its exact `.semgate`, `.codex` or `.agents`
+top-level trees, which the worker hides. Operator state beneath `.git` is
+rejected: Git metadata is read-only but remains readable by worker programs.
+The trusted Semgate installation must be outside it.
 
 Generate the exact client spelling with `semgate.sendclient.development_invocation`.
 The command text is a single literal argument, so shell expansion happens only

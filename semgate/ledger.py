@@ -61,6 +61,17 @@ def turn_key(envelope: Dict[str, Any]) -> str:
     return f"{count}:" + " ".join(latest.split())
 
 
+def _judgment_controls(record: Dict[str, Any]) -> tuple:
+    """Metadata used to select history and interpret its votes, not private text."""
+    decision = record.get("decision") or {}
+    fields = ("decision", "stage", "reason_code", "policy_version", "envelope_digest", "evaluated_at", "latency_ms")
+    vote_fields = ("predicate", "vote", "p", "mean", "n", "value", "confidence", "probabilities")
+    return (record.get("record_type"), record.get("judgment_id"), record.get("ts"),
+            {key: decision.get(key) for key in fields},
+            [{key: vote[key] for key in vote_fields if key in vote}
+             for vote in decision.get("predicate_votes") or []])
+
+
 class Ledger:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -107,7 +118,13 @@ class Ledger:
                                   ("project", norm_root(envelope.environment.project_root or envelope.environment.cwd)))}
                 identities["privacy_trust_target_ids"] = [private_identity(key, "command", target)
                                                          for target in inner_commands(command)]
+                controls = _judgment_controls(record)
                 record, _ = safe_inputs(record, {}, seed=seed)
+                if _judgment_controls(record) != controls:
+                    # A private value can equal a stage, predicate, key or
+                    # score. Never let its replacement hide an adverse vote
+                    # as an unrelated record or an apparently empty window.
+                    raise InputUnsafe("private minimization changed history controls")
                 record.update(identities)
                 record["privacy_minimized"] = True
                 record["privacy_turn_id"] = private_turn

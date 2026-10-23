@@ -119,7 +119,7 @@ class PreparedBroker:
                 for path in (lexical, lexical.resolve()):
                     if path.is_relative_to(project):
                         parts = path.relative_to(project).parts
-                        if not parts or parts[0] not in {".semgate", ".codex", ".agents", ".git"}:
+                        if not parts or parts[0] not in {".semgate", ".codex", ".agents"}:
                             raise ValueError("operator state must be outside the project or in its protected metadata trees")
         self.consents = ConsentStore(Path(settings["consent_store"]))
         self.signature = self._signature()
