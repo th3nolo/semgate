@@ -90,8 +90,9 @@ def test_unescaped_smart_quote_is_not_a_verified_client_invocation(tmp_path, mon
 
 
 def test_windows_client_arguments_are_literal_in_actual_powershell_parser(tmp_path, monkeypatch):
-    powershell = shutil.which("pwsh") or (shutil.which("powershell") if sys.platform == "win32" else None)
-    if powershell is None:
+    shells = list(dict.fromkeys(path for path in (
+        shutil.which("pwsh"), shutil.which("powershell") if sys.platform == "win32" else None) if path))
+    if not shells:
         pytest.skip("PowerShell parser unavailable; this check is exercised on Windows CI")
     monkeypatch.setattr(sendclient, "os", SimpleNamespace(name="nt"))
     invocations, expected = [], []
@@ -105,14 +106,15 @@ def test_windows_client_arguments_are_literal_in_actual_powershell_parser(tmp_pa
             expected.append([python.as_posix(), "-I", Path(sendclient.__file__).resolve().as_posix(),
                              "run", target, "--connection", connection.resolve().as_posix()])
     # Only ParseInput is called: generated invocations are stdin data, never executed.
-    process = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-File",
-                              str(ROOT / "tests/helpers/parse_literal_command.ps1")],
-                             input=json.dumps(invocations), text=True, encoding="utf-8",
-                             capture_output=True, timeout=30, check=True)
-    parsed = json.loads(process.stdout)
-    assert len(parsed) == len(expected)
-    for index, (actual, values) in enumerate(zip(parsed, expected)):
-        assert actual["errorCount"] == 0, (index, actual)
-        assert actual["statementCount"] == actual["commandCount"] == 1, (index, actual)
-        assert actual["elementTypes"] == ["StringConstantExpressionAst"] * 7, (index, actual)
-        assert actual["values"] == values, (index, actual)
+    for powershell in shells:
+        process = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-File",
+                                  str(ROOT / "tests/helpers/parse_literal_command.ps1")],
+                                 input=json.dumps(invocations), text=True, encoding="utf-8",
+                                 capture_output=True, timeout=30, check=True)
+        parsed = json.loads(process.stdout)
+        assert len(parsed) == len(expected)
+        for index, (actual, values) in enumerate(zip(parsed, expected)):
+            assert actual["errorCount"] == 0, (powershell, index, actual)
+            assert actual["statementCount"] == actual["commandCount"] == 1, (powershell, index, actual)
+            assert actual["elementTypes"] == ["StringConstantExpressionAst"] * 7, (powershell, index, actual)
+            assert actual["values"] == values, (powershell, index, actual)

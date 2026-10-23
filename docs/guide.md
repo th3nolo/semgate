@@ -304,6 +304,12 @@ inputs retain the redacted projection. Mixed JSON/percent encodings have the
 same bounded decoding depth as the local structure limit and fail closed when
 that limit is exceeded.
 
+Percent-encoded JSON and CSV/TSV containers also pass through structured-field
+inspection, including containers carried in URL-encoded form values. When a
+structured projection changes, its complete redacted representation is encoded
+again; quoted cells cannot retain recoverable private values. Benign inputs keep
+their original spelling. These projections are model data and are never executed.
+
 When local detection finds sensitive data, `semgate/privacy.py` requires a
 privacy decision before the ordinary permission provider sees the action.
 With remote calls disabled the result is a review. With the operator's
@@ -408,6 +414,14 @@ the task ends; expiry remains a bound if that signal is lost. Closing a task
 is permanent for that principal/project/task id, including other recipients.
 Use a new id for a new task. A grant permits new inspected records within
 its category scope, never credential disclosure or incomplete inspection.
+
+The prepared broker resolves enabled work profiles once for its protected task,
+using the current immutable payload to seed minimization. It reuses that resolution
+for preparation, permission checks and dispatch while retaining exact purpose
+matching and the ordinary approval step. An unrelated route's missing source, or
+the number of other routes, cannot change this payload's purpose. This works with
+or without the optional profile cache file; changed protected task/configuration
+still requires restarting the broker.
 
 Outcomes distinguish `allow`, `deny`, `needs_consent`, `needs_inspection` and
 `service_error`. Only `needs_consent` is an operator consent question. Task

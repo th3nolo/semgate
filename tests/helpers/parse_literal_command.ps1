@@ -1,4 +1,6 @@
 $ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $inputs = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $result = foreach ($text in $inputs) {
     $tokens = $null

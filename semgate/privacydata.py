@@ -15,6 +15,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping
+from urllib.parse import parse_qsl, quote, unquote_plus, urlencode
 
 from . import secretfinder
 
@@ -187,6 +188,8 @@ class Minimizer:
 
     def _structured_text(self, value: str, depth: int) -> str:
         """Sanitize parsed containers, preserving surrounding unstructured text."""
+        if depth > MAX_DEPTH:
+            raise InputUnsafe("privacy structure limit exceeded")
         if len(value) > MAX_TEXT:
             raise InputUnsafe("privacy text limit exceeded")
         table = self._table_text(value, depth)
@@ -214,6 +217,29 @@ class Minimizer:
             cursor = index = end
         if pieces:
             return "".join([*pieces, value[cursor:]])
+        # A form value may itself be a supported JSON/CSV/TSV container. Parse
+        # the encoded field boundaries before decoding, so escaped ampersands
+        # and quoted cells remain data. Never normalize an unchanged input.
+        if "=" in value and all(re.fullmatch(r"[A-Za-z0-9_.%+\[\]-]{1,256}=[\s\S]*", part)
+                                for part in value.split("&")):
+            try:
+                fields = parse_qsl(value, keep_blank_values=True, max_num_fields=MAX_NODES)
+            except (ValueError, UnicodeError) as exc:
+                raise InputUnsafe("uninspectable encoded form") from exc
+            cleaned = [(key, self.clean(cell, key=key, depth=depth + 1)) for key, cell in fields]
+            if cleaned != fields:
+                return urlencode(cleaned)
+        if _PERCENT_BYTES.search(value):
+            try:
+                decoded = unquote_plus(value)
+            except UnicodeError as exc:
+                raise InputUnsafe("uninspectable encoded structure") from exc
+            cleaned = self._structured_text(decoded, depth + 1)
+            if cleaned != decoded:
+                # This is a sanitized model projection, not executable input.
+                # Re-encode the complete structured projection so CSV quoting
+                # and JSON escaping cannot leave a recoverable private cell.
+                return quote(cleaned, safe="")
         return value
 
     def _table_text(self, value: str, depth: int) -> str | None:

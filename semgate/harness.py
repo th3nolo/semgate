@@ -350,7 +350,7 @@ def _ledger_event(config: Mapping[str, Any], event: str, detail: Dict[str, Any])
 def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optional[Dict[str, Any]] = None,
                 line_bytes: int = 0, *, prepared: Any = None, consents: Any = None,
                 offline_shell: bool = False, execution_facts: Any = None,
-                consume_approval: bool = True, execution_paths: Any = None) -> Dict[str, Any]:
+                consume_approval: bool = True, execution_paths: Any = None, prepared_profiles: Any = None) -> Dict[str, Any]:
     """One check through run_core and the approval step. `req` is validated
     here (again). Returns the answer object (not yet recorded as
     host_response: the caller does that, as serve does). Raises on errors;
@@ -379,6 +379,7 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
         prepared_disclosure=prepared, consent_store=consents, trusted_offline_shell=offline_shell,
         trusted_execution_facts=execution_facts,
         execution_paths=execution_paths,
+        prepared_profiles=prepared_profiles,
     )
     decision = _TO_HOST.get(str(result.get("decision")), "ask")
     reason = str(result.get("reason", ""))
@@ -396,7 +397,7 @@ def judge_check(req: Mapping[str, Any], config: Mapping[str, Any], meta: Optiona
 
 
 def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path],
-                   consume_approval: bool = True, recent: Optional[List[dict]] = None) -> Any:
+                   consume_approval: bool = True, recent: Optional[List[dict]] = None, prepared_profiles: Any = None) -> Any:
     """Trusted broker path through the complete hook/harness pipeline, synchronously.
 
     This function only judges. PreparedSender owns dispatch; a caller deadline
@@ -412,7 +413,8 @@ def check_prepared(prepared: Any, *, consents: Any, config: Union[str, Path],
                             "cwd": prepared.scope.project,
                             "user_message": task_request, "user_messages": [task_request], "recent": recent or []})
     meta: Dict[str, Any] = {}
-    out = judge_check(req, cfg, meta, prepared=prepared, consents=consents, consume_approval=consume_approval)
+    out = judge_check(req, cfg, meta, prepared=prepared, consents=consents, consume_approval=consume_approval,
+                      prepared_profiles=prepared_profiles)
     # judge_check settles only ordinary approvable asks, after privacy passes.
     # Keep that authorized result; preparation previews do not consume it.
     out = _record_answer(cfg, req, out, meta)

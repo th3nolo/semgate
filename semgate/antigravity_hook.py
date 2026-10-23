@@ -455,6 +455,7 @@ def _run_core(
     trusted_offline_shell: bool = False,
     trusted_execution_facts: Any = None,
     execution_paths: Any = None,
+    prepared_profiles: Any = None,
 ) -> Dict[str, Any]:
     """Host-neutral decision pipeline shared by every hook adapter.
 
@@ -521,8 +522,10 @@ def _run_core(
     # the operator's declared domains.
     prof_cfg = config.get("profiles") if isinstance(config.get("profiles"), Mapping) else {}
     from . import profiles as _profiles
+    if prepared_profiles is not None and prepared_disclosure is None:
+        raise ValueError("fixed profiles require the private prepared path")
     grant, kinds, table = _profiles.resolve(grant, prof_cfg, session_id=session_id,
-                                           messages=user_messages(), provider=provider)
+                                           messages=user_messages(), provider=provider, resolved=prepared_profiles)
     envelope = build_envelope(grant)
     if execution_paths is not None:
         from .devworker import VerifiedOfflineFacts

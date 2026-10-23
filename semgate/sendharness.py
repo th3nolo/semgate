@@ -6,7 +6,7 @@ dispatch to an abandonable judgment/deadline worker.
 """
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import math
@@ -32,22 +32,33 @@ class _HarnessGate(Gate):
                          project_root=broker.settings["project_root"], session_id=broker.settings["task_id"],
                          privacy_gate=PrivacyGate(consents=broker.consents, require_prepared=True))
         self.broker = broker
+        self.profile_resolution = None
+        self.profile_lock = threading.Lock()
+
+    def bind_prepared(self, prepared: PreparedSend) -> None:
+        """Resolve the protected task once, seeded by the current snapshot."""
+        cfg = self.broker.config
         profiles = cfg.get("profiles")
-        if isinstance(profiles, dict) and profiles.get("enabled") is True:
+        if not isinstance(profiles, dict) or profiles.get("enabled") is not True:
+            return
+        with self.profile_lock:
+            if self.profile_resolution is not None:
+                return
             from .antigravity_hook import configured_provider
             from .profiles import resolve
             from .providers.safe import for_envelope
-            context = self.envelope("", tool="http_request", arguments={
-                "files": [route["source_file"] for route in broker.settings["routes"].values()]})
-            provider = for_envelope(configured_provider(cfg), context)
-            grant, _, _ = resolve(grant, profiles, session_id=broker.settings["task_id"],
-                                  messages=[broker.task_request()], provider=provider)
+            context = self.envelope("", tool="http_request", arguments=prepared.arguments())
+            provider = for_envelope(configured_provider(cfg), context, prepared=prepared)
+            grant, kinds, _ = resolve(self.grant, profiles, session_id=self.broker.settings["task_id"],
+                                      messages=[self.broker.task_request()], provider=provider)
             self.grant = grant
+            self.profile_resolution = kinds
 
     def check_prepared(self, prepared: PreparedSend, *, consume_approval: bool = True):
         self.broker.ensure_current()
         return harness.check_prepared(prepared, consents=self.broker.consents, config=self.broker.config_path,
-                                      consume_approval=consume_approval, recent=self.broker.recent_context())
+                                      consume_approval=consume_approval, recent=self.broker.recent_context(),
+                                      prepared_profiles=self.profile_resolution)
 
 
 class _SnapshotTransport:
@@ -174,6 +185,7 @@ class PreparedBroker:
             body = canonicalize(prepared.body, route["contract"])
         except (ValueError, UnicodeError):
             return {"disposition": "needs_inspection", "reason_code": "prepared_contract_mismatch", "delivery": "not_sent"}
+        self.sender.gate.bind_prepared(replace(prepared, body=body, content_format=route["contract"]["format"]))
         prepared = self.sender.prepare(body, destination=route["destination"], source=prepared.scope.source,
                     categories=prepared.categories, classification_complete=prepared.classification_complete,
                     method=route["method"], content_format=route["contract"]["format"])
