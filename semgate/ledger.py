@@ -119,12 +119,29 @@ class Ledger:
                 identities["privacy_trust_target_ids"] = [private_identity(key, "command", target)
                                                          for target in inner_commands(command)]
                 controls = _judgment_controls(record)
+                privacy = record["decision"].get("evidence", {}).get("privacy", {})
+                counts = privacy.get("categories")
+                counter_rows = (isinstance(counts, dict) and all(isinstance(k, str) and type(v) is int and v >= 0
+                                                                for k, v in counts.items()))
+                if counter_rows:
+                    # Analyzer counts are metadata, not values in PII fields.
+                    # Keep their public mapping shape after sanitization, but
+                    # do not teach the learner that email: 1 is an address.
+                    privacy["categories"] = [{"category": k, "count": v} for k, v in counts.items()]
                 record, _ = safe_inputs(record, {}, seed=seed)
                 if _judgment_controls(record) != controls:
                     # A private value can equal a stage, predicate, key or
                     # score. Never let its replacement hide an adverse vote
                     # as an unrelated record or an apparently empty window.
                     raise InputUnsafe("private minimization changed history controls")
+                if counter_rows:
+                    privacy = record["decision"]["evidence"]["privacy"]
+                    rows = privacy["categories"]
+                    if any(type(row["count"]) is not int or row["count"] < 0 for row in rows):
+                        raise InputUnsafe("private minimization changed analyzer counts")
+                    # Reconstruct only from sanitized rows; never reinsert raw
+                    # payload values or skip the history-control comparison.
+                    privacy["categories"] = {row["category"]: row["count"] for row in rows}
                 record.update(identities)
                 record["privacy_minimized"] = True
                 record["privacy_turn_id"] = private_turn

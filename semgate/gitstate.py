@@ -227,6 +227,14 @@ class GitFacts:
             # A gitlink does not preserve its submodule's working bytes. Do
             # not recurse into another repository to manufacture recovery.
             return TargetState(path, "nogit")
+        if tracked.strip():
+            code, flags = self._git(root, "ls-files", "-v", "-z", "--", rel)
+            entries = [entry for entry in flags.split("\0") if entry]
+            # Lowercase tags mean assume-unchanged; S means skip-worktree.
+            # Neither establishes that current bytes match a saved object.
+            # Refuse recovery without changing the operator's index or flags.
+            if code != 0 or not entries or any(not entry.startswith("H ") for entry in entries):
+                return TargetState(path, "nogit")
         code, out = self._git(root, "status", "--porcelain", "--ignored", "--untracked-files=all", "--", rel)
         if code != 0:
             return TargetState(path, "nogit")
