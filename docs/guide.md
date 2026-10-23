@@ -289,6 +289,13 @@ attributes leave inspection incomplete. `--data-raw` and `--form-string`
 keep their literal semantics. This remains a bounded command inspector; it
 does not certify ambient curl configuration or arbitrary program effects.
 
+Literal inline JSON in supported data options is parsed with duplicate-member
+checks before inspection can be complete. JSON escapes, nested JSON strings
+and quoted CSV/TSV cells are minimized in their decoded forms; serialized model
+inputs retain the redacted projection. Mixed JSON/percent encodings have the
+same bounded decoding depth as the local structure limit and fail closed when
+that limit is exceeded.
+
 When local detection finds sensitive data, `semgate/privacy.py` requires a
 privacy decision before the ordinary permission provider sees the action.
 With remote calls disabled the result is a review. With the operator's
@@ -642,7 +649,10 @@ Every job passes the existing grant, hard rules and ordinary permission decision
 Only the trusted execution path asserts the offline boundary. It runs in a fresh
 bubblewrap process tree with separate network/PID/mount namespaces, no inherited
 credentials or home, read-only system libraries and a writable `/workspace`.
-`.semgate`, `.codex` and `.agents` are hidden and read-only; `.git` and an existing
+Worker setup reserves empty `.semgate`, `.codex` and `.agents` mountpoints if
+they are absent, before admitting guest code. It creates no consent record or
+key and preserves existing contents and permissions. Linked or non-directory
+metadata roots fail closed. These namespaces are hidden and read-only; `.git` and an existing
 `.venv` are read-only. Git inspection works; Git metadata writes need a separate
 operator workflow. A Linux uv environment uses `/workspace/.venv-linux`, so it
 cannot replace a Windows environment. Install each project's own compatible

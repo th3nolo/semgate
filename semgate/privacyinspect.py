@@ -157,6 +157,13 @@ def inspect(envelope: Envelope, *, follow_files: bool = True) -> Inspection:
     references = _references(args) if follow_files else []
     from .privacycommands import file_references
     command_files = file_references(command)
+    try:
+        for content in command_files.inline_json:
+            inspect_content(result.cleaner, content, "json")
+    except (ValueError, UnicodeError, RecursionError):
+        result.minimization_complete = False
+        result.problem("inline_payload_uninspectable")
+        return result
     if follow_files:
         references.extend(command_files.references)
     for problem in command_files.problems:

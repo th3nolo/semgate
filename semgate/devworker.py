@@ -41,6 +41,18 @@ MAX_OUTPUT = 16384
 # mount plan in execute()). The same name deeper in the project is an ordinary
 # writable directory in the guest, so its files stay inside the audited view.
 PROTECTED_PROJECT_NAMES = frozenset({".semgate", ".codex", ".agents", ".git", ".venv"})
+_METADATA_NAMES = (".semgate", ".codex", ".agents")
+
+
+def _reserve_metadata(project: Path) -> None:
+    """Reserve empty mountpoints before guest code; never initialize authority."""
+    for name in _METADATA_NAMES:
+        path = project / name
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise ValueError("protected metadata root must not be a link")
+        path.mkdir(mode=0o700, exist_ok=True)
+        if not path.is_dir():
+            raise ValueError("protected metadata root must be a directory")
 
 # A Windows name surrogate (directory junction) is reported by lstat as a
 # directory with a reparse tag. Following it would count the target's names as
@@ -526,14 +538,13 @@ def execute(payload: dict) -> dict:
     argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/tools",
              "--ro-bind" if read_only else "--bind", str(project), "/workspace"]
     # A mount point cannot be renamed out of the way from inside the guest.
-    for name in (".semgate", ".codex", ".agents"):
+    for name in _METADATA_NAMES:
         # Only the fixed -I archiver needs its recovery store. No shell, Git,
         # project imports or other agent code runs in this profile. A trailing
         # git status runs in a separate ordinary, metadata-hidden namespace.
         if cleanup and name == ".semgate":
             continue
-        if (project / name).exists():
-            argv += ["--tmpfs", "/workspace/" + name, "--remount-ro", "/workspace/" + name]
+        argv += ["--tmpfs", "/workspace/" + name, "--remount-ro", "/workspace/" + name]
     if (project / ".git").exists():
         argv += ["--ro-bind", str(project / ".git"), "/workspace/.git"]
     if (project / ".venv").exists():
@@ -582,6 +593,7 @@ def execute(payload: dict) -> dict:
         else:
             guest = ["/bin/sh", "-c", payload["command"]]
         argv += ["--seccomp", str(filter_file.fileno()), "--", *guest]
+        _reserve_metadata(project)
         process = proc.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    pass_fds=tuple(inherited), start_new_session=True)
         streams, truncated = [bytearray(), bytearray()], [False, False]

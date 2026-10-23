@@ -22,6 +22,8 @@ MAX_TEXT = 262144
 MAX_NODES = 8192
 MAX_DEPTH = 20
 _PERCENT_BYTES = re.compile(r"(?:%[0-9a-fA-F]{2})+")
+_JSON_ESCAPE = re.compile(r'\\u[dD][89aAbB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})')
+_JSON_START = re.compile(r"[\[{]")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
 _SSN = re.compile(r"(?<!\d)(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?!\d)")
 _PHONE = re.compile(r"(?<![\w\d])\+\d[\d ().-]{7,22}\d(?!\d)")
@@ -50,16 +52,18 @@ class InputUnsafe(ValueError):
     """Inspection/minimization could not finish; never send a partial result."""
 
 
+def _unique_json_pairs(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise InputUnsafe("duplicate JSON member")
+        out[key] = value
+    return out
+
+
 def json_value(text: str) -> Any:
     """Decode data without silently discarding an earlier object member."""
-    def unique(pairs):
-        out = {}
-        for key, value in pairs:
-            if key in out:
-                raise InputUnsafe("duplicate JSON member")
-            out[key] = value
-        return out
-    return json.loads(text, object_pairs_hook=unique)
+    return json.loads(text, object_pairs_hook=_unique_json_pairs)
 
 
 def _field_key(key: str) -> str:
@@ -147,6 +151,22 @@ def _decoded_view(text: str, spans: list[tuple[int, int]]) -> tuple[str, list[tu
     return "".join(pieces), positions
 
 
+def _json_decoded_view(text: str, spans: list[tuple[int, int]]) -> tuple[str, list[tuple[int, int]]]:
+    """Decode JSON escapes, retaining the full source span (including pairs)."""
+    pieces, positions, cursor = [], [], 0
+    for match in _JSON_ESCAPE.finditer(text):
+        pieces.append(text[cursor:match.start()])
+        positions.extend(spans[cursor:match.start()])
+        decoded = json.loads('"' + match.group() + '"')
+        source = (spans[match.start()][0], spans[match.end() - 1][1])
+        pieces.append(decoded)
+        positions.extend([source] * len(decoded))
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    positions.extend(spans[cursor:])
+    return "".join(pieces), positions
+
+
 class Minimizer:
     """One stable placeholder per value across state, task and questions."""
 
@@ -165,64 +185,96 @@ class Minimizer:
             self.values[value] = f"<PRIVATE_{category.upper()}_{self.counts[category]}>"
         return self.values[value]
 
-    def _learn_structured_text(self, value: str, depth: int) -> None:
-        """Learn labeled values in string containers before replacing them."""
+    def _structured_text(self, value: str, depth: int) -> str:
+        """Sanitize parsed containers, preserving surrounding unstructured text."""
         if len(value) > MAX_TEXT:
             raise InputUnsafe("privacy text limit exceeded")
-        text = value.lstrip("\ufeff \t\r\n")
-        if text.startswith(("{", "[")):
+        table = self._table_text(value, depth)
+        if table is not None:
+            return table
+        decoder = json.JSONDecoder(object_pairs_hook=_unique_json_pairs)
+        pieces, cursor, index = [], 0, 0
+        while index < len(value):
+            match = _JSON_START.search(value, index)
+            if match is None:
+                break
+            start = match.start()
+            self.nodes += 1
+            if self.nodes > MAX_NODES:
+                raise InputUnsafe("privacy structure limit exceeded")
             try:
-                parsed = json_value(text)
+                parsed, end = decoder.raw_decode(value, start)
             except json.JSONDecodeError:
-                lines = [line for line in text.splitlines() if line.strip()]
-                if len(lines) > 1 and all(line.lstrip().startswith('{"') for line in lines):
-                    try:
-                        parsed = [json_value(line) for line in lines]
-                    except json.JSONDecodeError:
-                        return
-                else:
-                    return
-            if isinstance(parsed, (Mapping, list)):
-                self.clean(parsed, depth=depth + 1)
-            return
+                index = start + 1
+                continue
+            except RecursionError as exc:
+                raise InputUnsafe("privacy structure limit exceeded") from exc
+            cleaned = self.clean(parsed, depth=depth + 1)
+            pieces.extend((value[cursor:start], json.dumps(cleaned, ensure_ascii=True) if cleaned != parsed else value[start:end]))
+            cursor = index = end
+        if pieces:
+            return "".join([*pieces, value[cursor:]])
+        return value
+
+    def _table_text(self, value: str, depth: int) -> str | None:
+        text = value.lstrip("\ufeff \t\r\n")
         if "\n" not in text and "\r" not in text:
-            return
+            return None
         first = text.splitlines()[0]
         delimiter = "\t" if "\t" in first else ","
         try:
             headers = next(csv.reader([first], delimiter=delimiter), [])
         except csv.Error:
-            return
+            return None
         if not any(_field_key(header) in FIELDS or (
                 re.fullmatch(r"[A-Za-z_][\w.-]{0,79}", header.strip())
                 and secretfinder.quoted_name(_field_key(header))) for header in headers):
-            return
+            return None
         try:
             reader = csv.reader(io.StringIO(text), delimiter=delimiter, strict=True)
             next(reader)
+            rows, changed = [], False
             for row in reader:
                 if not row:
                     continue
                 if len(row) != len(headers):
                     raise InputUnsafe("uninspectable structured row")
-                # Per-column traversal preserves repeated labels as well.
-                for header, cell in zip(headers, row):
-                    self.clean(cell, key=header, depth=depth + 1)
+                # Serialize the sanitized cells, including CSV quote doubling
+                # and embedded newlines; decoded values may not occur verbatim.
+                cleaned = [self.clean(cell, key=header, depth=depth + 1) for header, cell in zip(headers, row)]
+                rows.append(cleaned)
+                changed |= cleaned != row
+            clean_headers = [self.text(header) for header in headers]
+            if changed or clean_headers != headers:
+                output = io.StringIO(newline="")
+                writer = csv.writer(output, delimiter=delimiter, lineterminator="\n")
+                writer.writerow(clean_headers)
+                writer.writerows(rows)
+                return output.getvalue()
         except csv.Error as exc:
             raise InputUnsafe("uninspectable structured text") from exc
+        return value
 
     def text(self, value: str) -> str:
         if len(value) > MAX_TEXT:
             raise InputUnsafe("privacy text limit exceeded")
         views = [(value, None)]
         decoded, spans = value, None
-        for _ in range(2):
-            if not _PERCENT_BYTES.search(decoded):
+        for _ in range(MAX_DEPTH):
+            changed = False
+            for pattern, decode in ((_PERCENT_BYTES, _decoded_view), (_JSON_ESCAPE, _json_decoded_view)):
+                if not pattern.search(decoded):
+                    continue
+                if spans is None:
+                    spans = [(i, i + 1) for i in range(len(value))]
+                decoded, spans = decode(decoded, spans)
+                views.append((decoded, spans))
+                changed = True
+            if not changed:
                 break
-            if spans is None:
-                spans = [(i, i + 1) for i in range(len(value))]
-            decoded, spans = _decoded_view(decoded, spans)
-            views.append((decoded, spans))
+        else:
+            if _PERCENT_BYTES.search(decoded) or _JSON_ESCAPE.search(decoded):
+                raise InputUnsafe("privacy decoding depth exceeded")
         for text, _ in views:
             for hit in find(text):
                 if hit.value not in self.values.values():
@@ -256,8 +308,7 @@ class Minimizer:
         self.nodes += 1
         if self.nodes > MAX_NODES or depth > MAX_DEPTH:
             raise InputUnsafe("privacy structure limit exceeded")
-        if isinstance(value, str):
-            self._learn_structured_text(value, depth)
+        structured = self._structured_text(value, depth) if isinstance(value, str) else None
         category = FIELDS.get(_field_key(key))
         if category and value is not None and not isinstance(value, (Mapping, list, tuple)):
             raw = str(value)
@@ -281,7 +332,8 @@ class Minimizer:
             if (secretfinder.quoted_name(normalized_key) and (secretfinder.quoted_value(value)
                     or secretfinder.secret_name(normalized_key) and secretfinder.secret_value(value, normalized_key, True))):
                 self.remember("secret", value)
-            return self.text(value)
+                return self.text(value)
+            return self.text(structured)
         if isinstance(value, Mapping):
             return {self.text(str(k)): self.clean(v, key=str(k), depth=depth + 1) for k, v in value.items()}
         if isinstance(value, (list, tuple)):

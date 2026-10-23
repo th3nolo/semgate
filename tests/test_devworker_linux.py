@@ -70,7 +70,7 @@ class TestOfflineBoundary(unittest.TestCase):
             self.assertGreaterEqual(tuple(map(int, facts.launcher_version.split('.'))), (0,12,0))
             self.assertEqual(len(facts.launcher_sha256),64)
             self.assertIn("trusted broker", facts.render())
-            self.assertEqual(sorted(p.name for p in self.root.iterdir()), [".semgate"])
+            self.assertEqual(sorted(p.name for p in self.root.iterdir()), [".agents", ".codex", ".semgate"])
         finally:
             instance.close()
 
@@ -231,6 +231,25 @@ print('PROJECT_AND_SOURCE_READ_ONLY')
         (self.root/"state.py").write_text("from pathlib import Path\nassert not Path('.semgate/operator-canary').exists()\ntry: Path('.semgate/new').write_text('bad')\nexcept OSError: pass\nelse: raise AssertionError('operator state writable')\n")
         self.assertEqual(self.run_job("python3 state.py")["exit_code"],0)
         self.assertEqual((self.root/".semgate/operator-canary").read_text(),"synthetic operator state")
+
+    def test_initially_absent_authority_roots_cannot_be_seeded_by_guest(self):
+        project = self.root/"fresh-project"
+        project.mkdir()
+        self.assertFalse((project/".semgate").exists())
+        source = "from pathlib import Path\n"
+        source += "for name in ('.semgate','.codex','.agents'):\n"
+        source += " assert not list(Path(name).iterdir())\n"
+        source += " try: (Path(name)/'trust.key').write_bytes(b'forged')\n"
+        source += " except OSError: pass\n"
+        source += " else: raise AssertionError('authority namespace writable')\n"
+        (project/"attempt.py").write_text(source)
+        result = worker.execute({"project":str(project),"command":"python3 attempt.py","timeout_s":5,
+            "tools":{},"protected":[".semgate/consents.json",".semgate/trust.key"],
+            "bubblewrap":os.environ.get("SEMGATE_TEST_BWRAP","/usr/bin/bwrap"),
+            "bubblewrap_sha256":os.environ.get("SEMGATE_TEST_BWRAP_SHA256")})
+        self.assertEqual(result["exit_code"],0,result)
+        for name in (".semgate",".codex",".agents"):
+            self.assertEqual(list((project/name).iterdir()),[])
 
     def cleanup_cache(self, command="rm -rf __pycache__"):
         return worker.execute({"project":str(self.root), "cache_cleanup":command,

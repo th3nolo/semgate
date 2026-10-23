@@ -53,6 +53,7 @@ def test_private_category_metadata_preserves_following_benign_decisions(tmp_path
         first = sender.check(prepared)
         assert (first.decision, first.reason_code) == ("ask", "privacy_consent_required")
     row = list(gate.ledger.records())[-1]
+    assert first.evidence["privacy"]["categories"] == {"email": 1}
     assert not row.get("privacy_window_incomplete") and not row.get("envelope_omitted")
     assert row["decision"]["evidence"]["privacy"]["categories"]["email"] == 1
     for number in (42, 43):

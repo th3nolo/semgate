@@ -25,6 +25,7 @@ _SHORT_VALUE = {v for v in _BODY | _VALUE if v.startswith("-") and not v.startsw
 class CommandFiles:
     references: List[str] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
+    inline_json: List[str] = field(default_factory=list)
 
     def problem(self, code: str) -> None:
         if code not in self.problems:
@@ -58,6 +59,9 @@ def _payload(result: CommandFiles, option: str, value: str) -> None:
         result.references.append(reference)
     elif value in {"", "@", "<"}:
         result.problem("empty_payload_reference")
+    elif option in {"--json", "--data", "-d", "--data-ascii", "--data-binary", "--data-raw"}:
+        if option == "--json" or value.lstrip().startswith(("{", "[")):
+            result.inline_json.append(value)
 
 
 def file_references(command: str) -> CommandFiles:

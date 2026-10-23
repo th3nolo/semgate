@@ -20,6 +20,7 @@ later calibration and (much later) any non-shadow behavior must be built on.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -101,6 +102,7 @@ class Ledger:
         if private:
             from .privacydata import safe_inputs
             try:
+                record["decision"] = deepcopy(record["decision"])
                 private_turn = self._private_turn_id(record["envelope"])
                 from .feedback import _command_of, norm_root
                 from .trustauth import key_for_store
