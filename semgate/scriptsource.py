@@ -86,6 +86,22 @@ class Invocation:
     cwd: str           # directory it is resolved against (after any `cd`)
 
 
+def offline_uv_argv(words: List[str]) -> List[str]:
+    """Inspect only an explicit offline, config-free uv wrapper; never execute it."""
+    if not words or _base(words[0]) not in {"uv", "uv.exe"}:
+        return words
+    if len(words) < 7 or words[1] != "run":
+        return []
+    index = 2
+    flags = set()
+    while index < len(words) and words[index].startswith("-"):
+        flags.add(words[index])
+        index += 1
+    if flags != {"--no-project", "--no-config", "--no-python-downloads", "--offline"}:
+        return []
+    return words[index:]
+
+
 def invocations(command: str, cwd: str) -> List[Invocation]:
     """Local script files the command runs through an interpreter."""
     out: List[Invocation] = []
@@ -98,6 +114,10 @@ def invocations(command: str, cwd: str) -> List[Invocation]:
         argv = shellparse.effective_argv(simple.tokens)
         if not argv:
             continue
+        inner = offline_uv_argv([t.value for t in argv])
+        if not inner:
+            continue
+        argv = argv[len(argv)-len(inner):]
         head = _base(argv[0].value)
         if head in ("cd", "pushd") and len(argv) >= 2:
             target = argv[1].value
@@ -482,6 +502,11 @@ def collect(envelope: Envelope, workspace: Any) -> ScriptEvidence:
         return ev
     if not ev.files:
         return ev
+    return render_evidence(ev)
+
+
+def render_evidence(ev: ScriptEvidence) -> ScriptEvidence:
+    """Render already-read immutable files through the same scrub/injection path."""
     bodies = []
     try:
         for f in ev.files:

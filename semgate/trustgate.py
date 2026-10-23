@@ -170,15 +170,35 @@ def user_turns_since_last_call(conv: Any, call_id: str = "") -> Turns:
 
 
 def _session_judgments(ledger_path: str, session_id: str) -> List[Dict[str, Any]]:
-    from . import filelock
-    needle = filelock.json_needle(session_id)
-    res = filelock.read_jsonl(ledger_path, keep=lambda line: needle in line and b'"judgment"' in line)
+    from pathlib import Path
+    from . import filelock, fingerprints
+    from .ledger import IncompleteWindow, private_match
+    path = Path(ledger_path).expanduser()
+    if filelock.spill_files(path):
+        raise IncompleteWindow("judgment history has pending spill records")
+    res = filelock.read_jsonl_locked(path)
+    if res.malformed or res.partial_tail:
+        raise IncompleteWindow("judgment history is incomplete")
+    key = None
     out = []
     for r in res.records:
         if r.get("record_type") != "judgment":
             continue
+        if r.get("privacy_window_incomplete"):
+            raise IncompleteWindow("private judgment history omitted decision context")
         env = r.get("envelope") or {}
-        if str((env.get("environment") or {}).get("session_id", "")) == session_id:
+        sid = str((env.get("environment") or {}).get("session_id", ""))
+        if r.get("privacy_minimized") and r.get("privacy_session_id"):
+            if key is None:
+                key = fingerprints.read_existing_key(path.with_name(trust_mod.KEY_NAME))
+            matched = private_match(key, r["privacy_session_id"], "session", session_id)
+            if matched is None:
+                raise IncompleteWindow("private history cannot attribute the session")
+            if matched:
+                out.append(r)
+        elif r.get("privacy_session_unattributed"):
+            raise IncompleteWindow("private history cannot attribute the session")
+        elif sid == session_id:
             out.append(r)
     return out
 
@@ -209,15 +229,37 @@ def _flagged_untrusted(r: Mapping[str, Any]) -> bool:
                for v in d.get("predicate_votes") or [])
 
 
-def untrusted_history(judgments: Sequence[Mapping[str, Any]], target: str) -> bool:
+def untrusted_history(judgments: Sequence[Mapping[str, Any]], target: str, *, ledger_path: str = "") -> bool:
     """A judgment of this session flagged `target` (or a trust add of it) as
     following untrusted content."""
+    key = None
     for r in judgments:
+        if not _flagged_untrusted(r):
+            continue
+        if r.get("privacy_minimized"):
+            from pathlib import Path
+            from . import fingerprints
+            from .ledger import private_match
+            try:
+                if key is None:
+                    if not ledger_path:
+                        return True
+                    key = fingerprints.read_existing_key(Path(ledger_path).expanduser().with_name(trust_mod.KEY_NAME))
+                targets = r.get("privacy_trust_target_ids")
+                if not isinstance(targets, list):
+                    return True
+                identities = [r.get("privacy_command_id"), *targets]
+                matches = [private_match(key, identity, "command", target) for identity in identities]
+                if any(value is None or value is True for value in matches):
+                    return True
+            except fingerprints.KeyUnavailable:
+                return True
+            continue
         args = ((r.get("envelope") or {}).get("action") or {}).get("arguments") or {}
         cmd = args.get("command")
         if not isinstance(cmd, str):
             continue
-        if (cmd == target or target in trust_mod.inner_commands(cmd)) and _flagged_untrusted(r):
+        if cmd == target or target in trust_mod.inner_commands(cmd):
             return True
     return False
 
@@ -361,7 +403,7 @@ def decide(command: str, sem: Any, conv: Any, *, call_id: str, session_id: str, 
     except Exception as exc:
         out.why = f"the ledger could not be read ({type(exc).__name__})"
         return out
-    if untrusted_history(judgments, req.command):
+    if untrusted_history(judgments, req.command, ledger_path=ledger_path):
         out.untrusted, out.why = True, "earlier in this session semgate saw this command follow a file or tool output"
         return out
     found = user_turns_since_last_call(conv, call_id)

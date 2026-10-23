@@ -30,14 +30,33 @@ States, per target path:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from . import proc
 
 RECOVERABLE = frozenset({"clean", "missing", "agent_created"})
+
+
+def _git_executable(cwd: str, project_root: str = "") -> Optional[str]:
+    """Pin an operator executable; never launch a writable project tool."""
+    found = shutil.which("git")
+    if not found:
+        return None
+    binary = Path(found).resolve(strict=True)
+    root = Path(project_root or cwd).resolve(strict=True)
+    if not project_root:
+        for parent in (root, *root.parents):
+            if (parent / ".git").exists():
+                root = parent
+                break
+    if not binary.is_file() or binary.is_relative_to(root):
+        return None
+    return str(binary)
 
 # Redirect sinks that write nothing to disk.
 _DEV_SINKS = re.compile(r"^/dev/(null|stdout|stderr|fd/\d+)$")
@@ -152,7 +171,32 @@ class GitFacts:
 
     def _git(self, cwd: str, *args: str) -> Tuple[int, str]:
         try:
-            p = proc.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=self.timeout)
+            binary = _git_executable(cwd, self.project_root)
+            if binary is None:
+                return 1, ""
+            # Content comparisons may invoke clean/process drivers. Enumerate
+            # their names without reading content, then disable every driver
+            # for this read only. Never run a project helper as host evidence.
+            env = dict(os.environ)
+            env.pop("GIT_CONFIG", None)  # config-only redirect must not hide status configuration
+            env["GIT_NO_LAZY_FETCH"] = "1"
+            prefix = [binary, "--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false"]
+            if args and args[0] == "status":
+                config = proc.run([*prefix, "config", "--includes", "--null", "--name-only", "--get-regexp",
+                                   r"^filter\..*\.(clean|smudge|process|required)$"], cwd=cwd,
+                                  env=env, capture_output=True, text=True, timeout=self.timeout)
+                if config.returncode not in (0, 1) or len(config.stdout) > 32768:
+                    return 1, ""
+                names = config.stdout.rstrip("\x00").split("\x00") if config.stdout else []
+                if len(names) > 128 or any(not re.fullmatch(r"filter\..+\.(clean|smudge|process|required)", name)
+                                           for name in names):
+                    return 1, ""
+                for driver in sorted({name.rsplit(".", 1)[0] for name in names}):
+                    for option, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")):
+                        prefix += ["-c", driver + "." + option + "=" + value]
+                prefix += ["-c", "status.submoduleSummary=false"]
+                args = (args[0], "--ignore-submodules=all", *args[1:])
+            p = proc.run([*prefix, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=self.timeout)
             return p.returncode, p.stdout
         except Exception:
             return 1, ""
@@ -178,6 +222,19 @@ class GitFacts:
         if not os.path.exists(full):
             return TargetState(path, "missing")
         rel = os.path.relpath(full, root)
+        code, tracked = self._git(root, "ls-files", "--stage", "--", rel)
+        if code != 0 or any(line.startswith("160000 ") for line in tracked.splitlines()):
+            # A gitlink does not preserve its submodule's working bytes. Do
+            # not recurse into another repository to manufacture recovery.
+            return TargetState(path, "nogit")
+        if tracked.strip():
+            code, flags = self._git(root, "ls-files", "-v", "-z", "--", rel)
+            entries = [entry for entry in flags.split("\0") if entry]
+            # Lowercase tags mean assume-unchanged; S means skip-worktree.
+            # Neither establishes that current bytes match a saved object.
+            # Refuse recovery without changing the operator's index or flags.
+            if code != 0 or not entries or any(not entry.startswith("H ") for entry in entries):
+                return TargetState(path, "nogit")
         code, out = self._git(root, "status", "--porcelain", "--ignored", "--untracked-files=all", "--", rel)
         if code != 0:
             return TargetState(path, "nogit")
@@ -188,8 +245,7 @@ class GitFacts:
             return self._untracked(path, full, raw)
         if lines:
             return TargetState(path, "dirty")
-        code, out = self._git(root, "ls-files", "--", rel)
-        if code == 0 and out.strip():
+        if tracked.strip():
             return TargetState(path, "clean")
         return self._untracked(path, full, raw)
 
@@ -340,7 +396,12 @@ class GitHistory:
 
     def _git(self, cwd: str, *args: str) -> Tuple[int, str]:
         try:
-            p = proc.run(["git", "-c", "core.fsmonitor=false", *args], cwd=cwd, capture_output=True, text=True,
+            binary = _git_executable(cwd)
+            if binary is None:
+                return 1, ""
+            env = dict(os.environ, GIT_NO_LAZY_FETCH="1")
+            p = proc.run([binary, "--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false", *args],
+                        cwd=cwd, env=env, capture_output=True, text=True,
                                timeout=self.timeout)
             return p.returncode, p.stdout
         except Exception:

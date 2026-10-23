@@ -248,6 +248,642 @@ pyproject.toml list the upload dates. Install semgate in its own venv (or with
 pipx), so that these pins do not conflict with the packages of your projects.
 The 0.4.0 docs said `pip install "semgate[typesafe]"`: it still works, the extra is now empty.
 
+## Optional privacy gate: local PII inspection and Jev + SUBQ
+
+The privacy gate is opt-in. Add this object to the operator-owned
+`semgate.json` to enable local inspection without paid provider calls:
+
+```json
+"privacy_gate": {"enabled": true, "allow_remote": false, "timeout_s": 5}
+```
+
+With privacy enabled, remote permission, work-kind, approval and exposure-intent
+calls are also disabled unless `allow_remote` is explicitly true. Fake and
+recorded providers remain available offline. This setting is not a release
+claim about either model's PII accuracy.
+
+`semgate/privacydata.py` detects email addresses, international phone numbers,
+US SSN shapes, Luhn-valid payment card numbers, and labeled English/Spanish
+name, address, birth-date, identity and health fields. It replaces detected
+values with consistent placeholders before a provider receives them. Input
+limits fail closed rather than sending a partly sanitized request. This is
+pattern and structured-field detection: unlabeled free-text names, addresses,
+health information and other identifying combinations are not comprehensively
+recognized.
+
+Configured permission questions are trusted control definitions: payload values
+cannot rewrite their score levels, choice labels, types or instructions. They
+are inspected separately, and detectable sensitive data in a fixed definition
+requires review instead of a provider call. User and attachment data still use
+the inspection-seeded minimizer. The generic `SafeProvider` default continues
+to minimize dynamic question text together with its state; fixed definitions
+are selected only by the application-owned configured/judgment paths.
+
+`semgate/privacyinspect.py` inspects outgoing inline arguments and explicit
+file references, including curl `@file` / upload arguments and structured
+attachment fields. File inspection is bounded to eight UTF-8 text, JSON,
+JSONL, CSV, TSV, Markdown or log files, each at most 256 KiB, inside the
+declared project root. Missing, linked, changing, oversized or unsupported
+files, stdin/pipelines, dynamic references, opaque programs and unsupported
+transports require review. It never runs a command, expands an environment
+variable, unpacks an archive, performs OCR or reads arbitrary paths.
+
+Curl arguments use the existing shell lexer and an explicit option grammar:
+`--upload-file=file`, `-Tfile`, multipart `--form "field=<file"` /
+`--form "field=@file"`, and `--data-urlencode name@file` are inspected.
+`--max-time` is a complete option, never a substring match for `-T`.
+Unknown curl options, config files, stdin, redirects and unsupported multipart
+attributes leave inspection incomplete. `--data-raw` and `--form-string`
+keep their literal semantics. This remains a bounded command inspector; it
+does not certify ambient curl configuration or arbitrary program effects.
+
+Literal inline JSON in supported data options is parsed with duplicate-member
+checks before inspection can be complete. JSON escapes, nested JSON strings
+and quoted CSV/TSV cells are minimized in their decoded forms; serialized model
+inputs retain the redacted projection. Mixed JSON/percent encodings have the
+same bounded decoding depth as the local structure limit and fail closed when
+that limit is exceeded.
+
+Percent-encoded JSON and CSV/TSV containers also pass through structured-field
+inspection, including containers carried in URL-encoded form values. When a
+structured projection changes, its complete redacted representation is encoded
+again; quoted cells cannot retain recoverable private values. Benign inputs keep
+their original spelling. These projections are model data and are never executed.
+
+When local detection finds sensitive data, `semgate/privacy.py` requires a
+privacy decision before the ordinary permission provider sees the action.
+With remote calls disabled the result is a review. With the operator's
+explicit `allow_remote: true`, it asks pinned `jev-1.13.0` and
+`subq-snap-preview` independently against the same minimized state. Payload
+bytes, command text and attachment paths are omitted from that privacy state;
+the judges receive category counts, destinations and minimized user requests.
+SUBQ's public preview name is not an immutable snapshot.
+
+Both must return allow with confidence at least 0.9 to clear this check.
+Both confident blocks deny the disclosure. Disagreement, review, low
+confidence, invalid responses, missing credentials, transport failures or
+the common deadline require review. This new threshold has not been
+calibrated with live calls. Probabilities are not averaged. The transport in
+`semgate/providers/subq.py` uses fixed official HTTPS endpoints, rejects
+redirects, makes no retries, bounds response size and does not log provider
+response bodies. `SUBQ_API_KEY` / `SEMGATE_SUBQ_API_KEY` uses the same fixed
+key lookup mechanism as Jev; no credential is copied into a child environment.
+
+The result is enforced again after learned, trusted and feedback approvals.
+It cannot soften an existing deny or approve another permission-layer ask.
+An allowed domain does not waive privacy inspection. Privacy reviews cannot
+be opened through ordinary chat approval or a harness approval id: change
+the payload or resolve the inspection/provider problem, then recheck. Hosts
+that cannot reliably show a prompt receive a deny; Claude and the HTTP/Python
+harness receive an ask. Developer shadow mode remains record-only.
+
+In Python, pass `privacy_gate=PrivacyGate()` to `Gate`, importing it from
+`semgate.privacy`. For isolated tests, `PrivacyGate(allow_remote=True,
+providers=[local_jev_double, local_subq_double])` injects two local providers.
+No live config, key or paid request is required to run
+`python -m pytest -q tests/test_privacy.py tests/test_privacy_enforcement.py`.
+
+Privacy-enabled judgment records are minimized before entering the ledger.
+Verified generated judgment hashes and typed numeric vote/latency fields do not
+teach the detector new PII values. They are still checked against private values
+found in the actual data before exact metadata is restored. A genuine collision,
+changed control structure or incomplete minimization still marks history incomplete;
+the ordinary text/card detector and approval rules remain unchanged.
+Other stores and host transcripts can still hold sensitive data; this is not
+comprehensive at-rest redaction. If minimized history cannot establish a
+session-drift window, the drift check abstains rather than silently dropping
+the earlier votes. New records use a keyed identity for the original user
+turn, so a normal follow-up starts a new window while same-turn votes remain
+available after minimization. Legacy redacted records without a comparable
+identity still require review. Each check re-inspects referenced files and
+records content hashes, but there is no atomic binding between a host's later
+file read and the inspected bytes. Use the prepared sender below when that
+binding is required. Post-tool exposure
+notices run after delivery and do not prevent an agent from seeing the output.
+Browser actions, final chat output and unhooked network paths remain outside
+this gate's enforcement boundary. Verify the providers' actual organization
+retention settings before permitting real personal data in user context.
+
+### Prepared sends and task-scoped consent
+
+The Python embedding API provides an explicit HTTP POST/PUT boundary in
+`semgate/preparedsend.py`. The host owns the task identity and the data's
+schema/provenance labels. A completeness assertion must come from that trusted
+host, never copied from agent-provided tool arguments. Pattern detection adds
+categories but does not prove that arbitrary free text has been classified.
+
+```python
+from pathlib import Path
+from semgate import ConsentStore, Gate, PreparedSender, PrivacyGate
+
+consents = ConsentStore(Path.home() / ".semgate/privacy/consents.json")
+gate = Gate("Diagnose hook conformance", provider="none",
+            project_root="/path/to/project",
+            grant={"allowed_domains": ["artifacts.example.test"]},
+            privacy_gate=PrivacyGate(consents=consents))
+sender = PreparedSender(gate, consents, task_id="hookconf-comparison-1")
+# The embedding host knows this producer emits a fully labeled diagnostic CSV.
+prepared = sender.prepare_file(Path("artifacts/report.csv"),
+    destination="https://artifacts.example.test/reports",
+    categories=frozenset({"technical_diagnostics"}), classification_complete=True)
+receipt = sender.send(prepared)
+# needs_consent: show prepared.scope, prepared.categories and prepared.digest
+# in the trusted operator UI, together with receipt.outcome.request_id.
+# Do not show or log prepared.body. Retry only after the operator answers.
+```
+
+`ConsentStore` (`semgate/privacyconsent.py`) coalesces identical pending
+requests. The operator approves in their own terminal after reviewing the
+displayed scope, using the returned id and the same protected store:
+
+```bash
+semgate consent approve REQUEST_ID --store ~/.semgate/privacy/consents.json
+semgate consent revoke REQUEST_ID --store ~/.semgate/privacy/consents.json
+semgate consent close-task REQUEST_ID --store ~/.semgate/privacy/consents.json
+```
+
+Approval defaults to the current task scope. `--snapshot` limits it to one
+payload digest; `--ttl-hours` can shorten the lifetime. The default and maximum
+lifetime is four hours; a host can configure a lower `ConsentStore.ttl_s`.
+The CLI cannot extend the host's requested limit. The existing admin process
+guard refuses agent callers, and approval requires the operator's typed
+confirmation. Consent administration is also hard-denied in tool commands.
+Authenticated embedding applications can call the store with `trustauth.Auth`
+on their operator side; Python imports are not an isolation boundary.
+
+Each reusable grant binds the principal, project, task, source, HTTP method,
+exact canonical destination (including path/query), purpose, categories and
+policy version. A new recipient, purpose or category needs new consent.
+Revocation stops future sends in that scope. The host calls `close_task` when
+the task ends; expiry remains a bound if that signal is lost. Closing a task
+is permanent for that principal/project/task id, including other recipients.
+Use a new id for a new task. A grant permits new inspected records within
+its category scope, never credential disclosure or incomplete inspection.
+
+The prepared broker resolves enabled work profiles once for its protected task,
+using the current immutable payload to seed minimization. It reuses that resolution
+for preparation, permission checks and dispatch while retaining exact purpose
+matching and the ordinary approval step. An unrelated route's missing source, or
+the number of other routes, cannot change this payload's purpose. This works with
+or without the optional profile cache file; changed protected task/configuration
+still requires restarting the broker.
+
+Outcomes distinguish `allow`, `deny`, `needs_consent`, `needs_inspection` and
+`service_error`. Only `needs_consent` is an operator consent question. Task
+grant matching is deterministic and makes no Jev/SubQ calls. The existing
+paired judge path remains available for ordinary privacy decisions; model
+agreement cannot mint a persistent consent. Ordinary approval ids, feedback,
+chat replies and tool-supplied classification flags cannot substitute for it.
+
+The sender retains immutable bytes, rechecks the full gate, and reads consent
+again under the revocation/task-closure lock at dispatch. It sends that same
+snapshot without reopening a source file. The ordinary permission envelope
+contains effect metadata and a digest, not the body: command text inside a
+HookConf report stays data and does not execute or enter permission prompts.
+Underlying permission asks still require their own authorization; they carry
+no privacy request id when privacy consent is already satisfied. In the
+prepared harness, an ordinary ask returns `needs_inspection` and its separate
+`approval_id`; the operator answers through `/v1/approve`. Preparing or
+previewing a snapshot preserves that one-time approval. Dispatch rechecks
+both gates and consumes the ordinary approval only on the dispatch path.
+Concurrent revocation and dispatch
+are serialized; revocation cannot cancel an already in-flight request. HTTPS
+is required except for explicit literal-loopback HTTP tests. The transport
+disables environment proxies, redirects and retries and reads no response
+body. Receipts distinguish `not_sent`, `response_received` (with HTTP status),
+and `unknown` after a transport failure. A lost response does not prove that
+the receiver got nothing; the caller must reconcile before retrying.
+
+Consent state uses existing cross-process locks, atomic JSON replacement and
+HMAC integrity helpers with `trust.key` next to the store. It persists keyed
+scope/task fingerprints, categories, digests, ids and lifecycle fields, with
+no raw body, recipient, purpose or source text. Corrupt state fails closed.
+Keep this state in the protected `.semgate` tree or an equivalently isolated
+operator store. HMAC does not stop same-user code that can read the key or
+roll back valid state; OS isolation is required for that threat model.
+
+This API does not install hooks or automatically reroute arbitrary shell
+commands. Task consent is usable only through the prepared path. Raw shell
+checks retain the earlier host-read race; every disclosure needing the stronger
+guarantee must use this sender or an equivalent enforced egress boundary.
+Run the regression and loopback tests with
+`python -m pytest -q tests/test_privacy_uploads.py tests/test_prepared_send.py`.
+
+### Prepared execution in the HTTP harness
+
+The existing `semgate serve --http` harness can now own the preparation and
+execution, using the same permission, enforcement and ledger path as hooks.
+Enable this profile in the operator's existing hook/server configuration:
+
+```json
+{
+  "mode": "enforce",
+  "privacy_gate": {"enabled": true, "require_prepared": true},
+  "enforcement": {
+    "enabled": true,
+    "auto_allow_tools": ["bash", "http_request", "read", "edit", "write"],
+    "block_when_unsure": true
+  },
+  "prepared_sends": {
+    "enabled": true,
+    "task_id": "diagnostics-task-1",
+    "project_root": "/absolute/project",
+    "task_context": {
+      "request": "Send the approved diagnostic report from this project.",
+      "expires_at": "2026-10-24T12:00:00Z"
+    },
+    "client_file": "/absolute/project/.semgate/send-client.json",
+    "consent_store": "/absolute/project/.semgate/consents.json",
+    "snapshot_ttl_s": 300,
+    "max_snapshots": 16,
+    "routes": {
+      "report": {
+        "source_file": "report.csv",
+        "destination": "https://artifacts.example.test/reports",
+        "method": "POST",
+        "categories": ["technical_diagnostics"],
+        "classification_complete": true,
+        "contract": {
+          "format": "csv",
+          "fields": {"status": {"enum": ["ready", "passed", "failed"]}},
+          "max_rows": 8
+        }
+      }
+    }
+  }
+}
+```
+
+Merge these settings with the existing `grant_file`, `policy_file`, provider
+and ledger settings. The operator grant must cover the project, exact recipient
+domain and tools used. Keep the Semgate installation and operator configuration
+outside agent write authority. `.semgate` is protected by the existing tool
+hard rules; stronger hostile same-user isolation requires OS controls.
+
+Before starting, replace `task_context.request` with the actual operator task
+and `expires_at` with an appropriate future timezone-aware expiry. The date above
+illustrates the format only. Preparation and dispatch require this active
+binding to the configured task and project; an absent or expired binding fails
+closed. Renewing a task binding does not grant disclosure consent or execution
+approval. [Codex with Semgate-owned execution](#codex-with-semgate-owned-execution)
+uses the same binding.
+
+Start the server with **different** `--token-file` and `--approve-token-file`.
+Keep the operator token outside the agent's allowed filesystem and environment.
+The agent token permits preparation and dispatch; it cannot describe or approve
+consent. The legacy `/v1/approve` endpoint and ordinary feedback cannot approve
+data consent. These new endpoints refuse a missing or shared token.
+
+The protected `client_file` contains exactly these connection settings:
+
+```json
+{
+  "schema": "semgate-send-client/1",
+  "base_url": "http://127.0.0.1:8765",
+  "token_file": "check.token"
+}
+```
+
+The broker URL must use HTTPS or literal loopback HTTP. The destination requires
+HTTPS; `allow_loopback_http: true` is available for explicit local canary tests.
+Give the agent the configured route names and these tool instructions:
+
+```bash
+"/absolute/semgate/.venv/bin/python" -I "/absolute/semgate/semgate/sendclient.py" prepare report --connection "/absolute/project/.semgate/send-client.json"
+"/absolute/semgate/.venv/bin/python" -I "/absolute/semgate/semgate/sendclient.py" dispatch PREPARED_ID --connection "/absolute/project/.semgate/send-client.json"
+```
+
+Use the **same interpreter and installed client file** as the hook. On Windows,
+use `.venv/Scripts/python.exe` and prefix the quoted invocation with PowerShell
+`& `. The hook verifies the exact argument structure and protected connection
+path. `-I` prevents project modules or `PYTHONPATH` from replacing client imports.
+Chaining, redirection, extra arguments and alternative scripts are refused.
+Other hard rules, operator grant expiry and the local auto-allow set still apply.
+
+The strict profile blocks ordinary outgoing actions and direct host shell
+commands. For local development, configure the offline worker below and send
+normal command text through the client's `run` action. An arbitrary program can
+hide network I/O, so a command-name allowlist cannot establish safe egress.
+Native file tools remain subject to normal policy and can edit the report.
+Existing non-strict configurations keep their behavior.
+Unknown tools, delegated executors and skill loaders are refused too. The
+strict local tool set is `read`, `edit`, `write`, `glob`, `grep`, `ls`, `ask_user`
+and `todo`; recognized outgoing actions still require prepared execution.
+
+Each route's closed CSV/JSON contract is validated on every preparation. Fields
+must be operator-enumerated strings or bounded integers (`{"integer": [0, 100]}`),
+with exact field names and a bounded row count. The broker parses then serializes
+that view; arbitrary strings, extra columns, duplicate JSON fields and unknown
+values stop with `needs_inspection`. This supports diagnostic views, not general
+free-text PII classification. Editing the source after preparation cannot change
+the saved bytes. Preparing the edited file validates it afresh.
+
+All five endpoints are POST with JSON bodies and bearer authorization:
+
+| Endpoint | Role | Body | Result |
+|---|---|---|---|
+| `/v1/send/prepare` | Agent | `{"route":"report"}` | Outcome, digest and opaque `prepared_id`; `request_id` when consent is needed |
+| `/v1/send/dispatch` | Agent | `{"prepared_id":"..."}` | Outcome and delivery receipt, with HTTP status when received |
+| `/v1/send/run` | Agent | `{"command":"python3 -m unittest -q"}` | Ordinary permission decision, then offline worker exit code and bounded output |
+| `/v1/send/describe` | Operator | `{"prepared_id":"..."}` | Exact scope, categories, byte count and digest; no body |
+| `/v1/send/consent` | Operator | `{"action":"approve","request_id":"..."}` | Consent lifecycle receipt |
+
+On `needs_consent`, the operator reviews the description and approves through
+the operator endpoint or existing guarded consent CLI using the same store.
+Approval defaults to task scope; `task_scope: false` binds a single digest.
+Optional `ttl_s` can only shorten the consent lifetime. The operator endpoint
+also accepts `revoke` and `close-task` with that consent `request_id`.
+The host must close the task when it ends. A later valid preparation within
+the same task and categories reuses approval. New scope requires new consent.
+
+The server keeps bounded snapshots in memory: default lifetime 300 seconds
+(maximum one hour), capacity 16 (maximum 64). Restart loses snapshots. Changing
+the operator config, policy or grant invalidates the broker until restart.
+Dispatch rechecks the full harness and consent even after a successful prepare.
+Revocation or task closure before dispatch blocks it. Concurrent attempts can
+start the transport at most once per id; uncertain delivery consumes the id
+and must be reconciled, never retried automatically. `needs_consent` without
+dispatch retains the snapshot until expiry.
+
+Dispatch runs synchronously outside the harness's abandonable judgment pool.
+Client disconnect or timeout is not cancellation; delivery may be unknown.
+The hook integration still depends on the host invoking and enforcing the hook.
+A CLI that ignores a crashed hook can escape this profile. The optional worker
+provides OS containment for its own process tree; it does not contain the host
+agent or tools that bypass the hook. Validate each actual host/version before
+relying on it.
+
+Run the HTTP, contract and client tests with
+`python -m pytest -q tests/test_prepared_harness.py tests/test_send_contracts.py`.
+HookConf's `hookconf.semgate_prepared` experiment exercises the real Codex CLI,
+Semgate server, native file edits, snapshot dispatch and consent revocation
+against a recording loopback endpoint, using only a scripted local model.
+
+### Offline development worker
+
+Add an operator-owned `development` object inside `prepared_sends` to enable
+ordinary Linux development commands alongside prepared uploads:
+
+```json
+"development": {
+  "backend": "wsl-bubblewrap",
+  "distribution": "Ubuntu",
+  "timeout_s": 300,
+  "bubblewrap": "/opt/semgate-tools/bwrap-0.12.0",
+  "tools": {"uv": "/home/your-user/.local/bin/uv"}
+}
+```
+
+This backend requires an already-running WSL distribution with existing
+`/usr/bin/python3`, Bubblewrap **0.12.0 or newer** and system `libseccomp.so.2`.
+`bubblewrap` selects an absolute Linux executable outside the project; it defaults
+to `/usr/bin/bwrap`. An optional `bubblewrap_sha256` pins its reviewed bytes.
+Every job checks its digest, version and non-setuid mode before sandbox setup.
+Older launchers are refused because CVE-2026-87766 permits a symlink escape during
+setup, which a network-isolation test alone cannot detect. A distribution's
+backported package version is not accepted as an implicit exception. The `bubblewrap`
+backend runs directly on Linux and omits `distribution`. Missing prerequisites
+or a failed sandbox return `service_error`; there is no unconfined fallback,
+package installation or distribution start. The broker holds an owned supervisor
+between WSL jobs and closes only that supervisor when it closes.
+
+The project directory must be case-sensitive. The worker probes the actual root
+before every job and refuses case-insensitive DrvFS directories: a spelling such
+as `.SeMgAtE` could otherwise evade a mount hiding `.semgate`. Use a case-sensitive
+workspace provisioned by the operator; this feature never changes its filesystem
+flag. Operator config, policy, grants and client/consent state must be outside
+the writable project or within its exact `.semgate`, `.codex` or `.agents`
+top-level trees, which the worker hides. Operator state beneath `.git` is
+rejected: Git metadata is read-only but remains readable by worker programs.
+The trusted Semgate installation must be outside it.
+
+Generate the exact client spelling with `semgate.sendclient.development_invocation`.
+The command text is a single literal argument, so shell expansion happens only
+inside the worker. For example, the generated POSIX invocation for a simple job is:
+
+```bash
+/absolute/semgate/.venv/bin/python -I /absolute/semgate/semgate/sendclient.py run 'python3 -m unittest -q' --connection /absolute/project/.semgate/send-client.json
+```
+
+On Windows, the generator single-quotes every argument, doubles all five ASCII
+and smart single-quote delimiters recognized by PowerShell, and prefixes `& `.
+Verification requires the exact canonical encoding. Use that generated spelling
+with the same interpreter as the hook. Parent
+shell chaining, interpolation or alternative clients are refused; chains inside
+the literal command argument run within the worker. The agent cannot supply a
+backend, project root, environment, tool path or trusted-offline flag through
+this endpoint. The command limit is 4096 characters.
+
+Every job passes the existing grant, hard rules and ordinary permission decision.
+Only the trusted execution path asserts the offline boundary. It runs in a fresh
+bubblewrap process tree with separate network/PID/mount namespaces, no inherited
+credentials or home, read-only system libraries and a writable `/workspace`.
+Worker setup reserves empty `.semgate`, `.codex` and `.agents` mountpoints if
+they are absent, before admitting guest code. It creates no consent record or
+key and preserves existing contents and permissions. Linked or non-directory
+metadata roots fail closed. These namespaces are hidden and read-only; `.git` and an existing
+`.venv` are read-only. Git inspection works; Git metadata writes need a separate
+operator workflow. A Linux uv environment uses `/workspace/.venv-linux`, so it
+cannot replace a Windows environment. Install each project's own compatible
+dependencies from its lockfile through an operator-controlled setup workflow.
+
+Private TCP/UDP loopback fixtures and anonymous Unix stream/seqpacket pairs work
+within a job. Other socket families, pathname Unix sockets and io_uring are
+blocked by a system-libseccomp filter. Programs and their children cannot reach
+host or Internet endpoints. A URL inside a build script does not bypass the
+namespace: the program can run, but that connection fails. External dependency
+fetches, browser services and Docker sockets are unavailable. Windows binaries
+and host-mounted Node package managers are not automatically usable as Linux
+toolchains; optional `tools` exposes only explicitly configured read-only Linux
+executables outside the project.
+
+One job runs at a time per broker. The deadline defaults to 300 seconds (maximum
+600); timeout kills its process tree. Each output stream retains at most 16 KiB
+and reports truncation. A completed job returns `boundary: bubblewrap-offline/1`,
+`exit_code`, `stdout`, `stderr` and `timed_out`. The client exits with the job's
+exit code. A permission refusal or worker error starts no unconfined command.
+Revoking upload consent does not revoke ordinary local development permission:
+tests can continue while the next prepared dispatch is denied.
+
+Run the API tests with `python -m pytest -q tests/test_development_harness.py`.
+On a Linux system with the existing prerequisites, run the real kernel checks
+with `python3 -I tests/test_devworker_linux.py`. Set `SEMGATE_TEST_BWRAP` and
+`SEMGATE_TEST_BWRAP_SHA256` for a reviewed alternative executable; an optional
+`SEMGATE_TEST_CASE_INSENSITIVE_ROOT` scratch parent enables the DrvFS regression.
+`SEMGATE_TEST_UV` adds the existing Linux uv executable's subprocess regression.
+These use a reachable control
+receiver, a direct and child-process upload attempt, private loopback/IPC, hidden
+operator state and a timeout descendant. HookConf's `--case development` runs
+real Codex tests/builds and hidden-upload attempts, then file mutation and
+consent revocation, including successful local tests after the revocation.
+
+### Codex with Semgate-owned execution
+
+Use `semgate agent` when the upload boundary must survive a crashed or timed-out
+hook. Hook-only Codex integrations cannot supply this guarantee: Codex 0.153.1
+treats failed hooks as advisory and may continue the original native tool call.
+The canonical shell client above is safe only while that hook is enforced.
+
+The guarded runner starts a fresh, isolated Codex app-server runtime outside the
+project. Every thread and turn explicitly selects `environments: []`, removing
+native shell and file executors. The runner registers three dynamic tools:
+
+| Agent tool | Executor that owns the effect |
+| --- | --- |
+| `semgate_run(command)` | Existing broker judgment, then the offline Linux worker |
+| `semgate_write(path, content)` | Existing broker judgment, then a literal UTF-8 file replacement in the same offline worker |
+| `semgate_prepare(route)` | PreparedSender's immutable snapshot and closed data contract |
+| `semgate_dispatch(prepared_id)` | PreparedSender with fresh scope, expiry and revocation checks |
+
+Reads and edits use ordinary Linux commands through `semgate_run`, as do tests,
+builds and Git inspection. They retain the worker's network, filesystem and
+process restrictions. There is no native host shell fallback. The agent cannot
+choose a recipient, approve consent, change the backend or supply an offline
+flag. Unexpected tool names, extra fields, replayed callback IDs, native approval
+requests, protocol errors and unavailable brokers do not authorize execution.
+
+For small literal file replacements, `semgate_write` avoids encoding data as
+an executable shell/Python program. It accepts an unprotected project-relative
+path and up to 4096 UTF-8 bytes; parent directories must exist. The fixed writer
+runs the system Python with `-I`, treats content as data, refuses symlinks and
+uses directory descriptors plus an atomic replacement (new file mode 0600).
+Replacing an entry does not modify a hard-linked inode. Hard rules, instruction
+file gates, actual task fit and all existing semantic thresholds still apply.
+Local fixture creation grants no upload authority: PreparedSender independently
+checks the snapshot contract and current consent. The task must actually request
+the local test; the tool cannot invent authorization from its content.
+
+This is a reference monitor: the executor checks authority at the effect, rather
+than treating a hook's successful return as a transferable permission. A failed
+advisory hook may let a dynamic call continue; the final executor still owns the
+same constrained path. Revocation acknowledged before dispatch's consent
+critical section prevents that dispatch. A send already in progress cannot be
+recalled; an uncertain network result is never retried automatically.
+
+Start the prepared broker with the strict profile and `development` settings
+above. Keep operator state, the Semgate installation and the selected Codex
+executable outside the writable project, and use an already-running Ubuntu
+distribution. The runner resolves executable aliases and refuses a target in
+the project before either host subprocess. Then, from the
+Semgate checkout's own installed environment:
+
+Bind the actual human task in the protected broker configuration before
+starting it. `task_id` and `project_root` bind this request to that task and
+workspace; `task_context.expires_at` must have a timezone and be in the future:
+
+```json
+"task_context": {
+  "request": "Inspect the project, implement the change, run its tests, and prepare the diagnostic report.",
+  "expires_at": "2026-10-22T12:00:00Z"
+}
+```
+
+This object belongs inside `prepared_sends`. Set an expiry appropriate for the
+current task; the example is only a format example. Requests are limited to
+4,000 characters so the existing envelope cannot silently truncate them.
+The CLI prompt must exactly match this protected request. The broker supplies
+it as `user_message` for development and prepared-send judgments. Agent tool
+arguments cannot set or replace it. Changing the broker's configuration, grant
+or policy requires a restart; a new task needs its own binding and consent.
+An expired task cannot run commands or dispatch snapshots. The operator can
+still revoke consent after expiry.
+
+Set `script_source: true` at the top level to give the judge bounded local
+script contents and test-run facts. The inspectors also recognize the explicit
+`uv run --no-project --no-config --no-python-downloads --offline` wrapper;
+unknown wrapper options supply no such evidence.
+
+On the private development path, a verified worker also enables bounded reads
+of unittest sources, statically named local imports and package initializers:
+at most 16 files and 24 KiB in total, following cycles only once. These
+files pass the existing catastrophic, human-gate, secret-scrubbing and
+instruction-marker checks before the model sees their content. Missing inputs,
+incomplete listings, invalid Python and exceeded bounds withhold source evidence.
+Discovery package initializers are inspected for hooks even when their names
+do not match the test pattern. Dynamic imports, external dependencies and
+discovery hooks are not claimed to be a closed call graph. Inspection reads
+source text without importing or executing it; every invocation reads it again.
+
+The `verified-offline/2` question profile clarifies the existing `effect` and
+`executes` scales for this verified execution context. A shown project build
+entry point is judged by its operations; its `.py` suffix alone does not make
+it opaque. Guest temporary files and bytecode caches are not host system
+changes. For unittest, computations and assertions are assessed from the shown
+code; intentional file writes remain project edits. Quiet or verbose reporting
+does not change the effects. Checking for an environment-variable name is not reading a secret
+value. Actual credential reads, destructive edits, uninspected scripts and
+dynamic evaluation retain their existing treatment. The level definitions,
+thresholds, router decisions and upload checks remain unchanged. Ordinary
+hook checks cannot opt into this profile by supplying tool arguments.
+
+```powershell
+uv run --no-sync --offline python -m semgate agent `
+  --config C:/operator/semgate.json `
+  --codex-bin C:/path/to/codex.exe `
+  --state-dir C:/operator/agent-runs `
+  --model YOUR_MODEL_ID `
+  --base-url https://YOUR_APPROVED_MODEL_PROVIDER/v1 `
+  --env-key YOUR_MODEL_KEY_ENV_VAR `
+  "Inspect the project, implement the change, run its tests, and prepare the diagnostic report."
+```
+
+`--state-dir` must already exist outside the project. The runner creates a fresh
+child runtime there and inherits only the selected model key plus basic process
+environment. It neither imports the personal Codex home nor installs a global
+hook. Inherited MCP/plugin capabilities or enabled execution features cause
+startup to stop. The Responses provider is an explicit operator-approved model
+processing destination: the transcript still reaches that provider. This runner
+does not claim to inspect or prevent PII in model input.
+
+Before each development judgment the broker runs a fixed `/usr/bin/true` probe
+through the actual worker profile. Only a successful kernel sandbox setup,
+supported launcher version and matching configured digest produce verified
+`execution_boundary` facts for Jev. Those facts describe the reachable network,
+filesystem and credential boundaries; they do not authorize the action. The
+requested command remains permission-gated and recreates the sandbox before
+execution. Setup failure has no host fallback. All model thresholds and the
+execution guard still apply, so a low-confidence decision can require review.
+PreparedSender still checks the exact snapshot, classification contract and
+current consent immediately before sending; worker facts cannot bypass it.
+
+Declared operator configuration, grants, policy and consent/key state must stay
+outside runtime trees exposed read-only to the worker, including `/usr` and
+`/etc/ssl`, and outside configured tool or Git metadata views. Read-only mounts
+preserve reads. The bootstrap refuses known overlapping paths and resolved
+aliases before agent execution; it does not move or rewrite host state.
+This placement check also applies when a project itself is under a shared
+runtime tree. Use an unexposed installation/state location for that profile.
+Known authority files and private-store files are also checked by inode for
+hard-link aliases in readable directory views. Ordinary read-only aliases of
+unrelated public source files remain supported; an incomplete check refuses
+the profile rather than claiming authority is hidden.
+
+Conventional linked Git worktrees retain read-only Git inspection. The broker
+resolves the worktree's metadata and common repository directory, then supplies
+guest-valid `.git`, `commondir`, and optional per-worktree configuration views.
+The main checkout's source directory is not mounted. Existing host pointers and
+configuration files are never repaired or rewritten. Operator authority inside
+shared Git metadata is refused, and exposed metadata is checked for special
+endpoints. Other external Git-pointer and alternate-object-store layouts are
+not part of this mapping and are refused before reporting a usable profile.
+
+The app-server contract is experimental, so the runner accepts only the locally
+validated Codex **0.153.1**. Other versions stop before starting an agent; validate
+and deliberately update the pin before adopting another release. A broken
+app-server or protocol stops the run. Broker failure returns a service error;
+normal commands resume when the broker is available, with no unconfined retry.
+The separate worker retains its own bounded deadline and process-tree cleanup.
+An agent deadline is not cancellation of an HTTP send already accepted by the
+broker; its delivery can remain unknown.
+
+Run `python -m pytest -q tests/test_codex_runner.py` for executor and protocol
+failure tests. HookConf's `hookconf.semgate_failures` runs real crash and timeout
+controls plus the guarded runner, verifies direct and post-revocation native
+upload attempts cannot run, revokes consent during the dispatch hook, edits the
+source after preparation, keeps unit tests/builds working, and stops the broker
+before a final dispatch. Its model and permission judgments are scripted;
+the CLI, hooks, worker, sender, consent state and receiver are real.
+
 ## Providers: two ways to reach Jev
 
 semgate's judge is Jev, TypeSafe's System One model. semgate can reach Jev in

@@ -49,7 +49,7 @@ from typing import Callable, List, Mapping, Optional, Sequence
 
 # Subcommands that change semgate's install or its strictness. `harness`
 # counts only with `init` (HARNESS_ADMIN).
-ADMIN_SUBCOMMANDS = frozenset({"init", "install", "uninstall", "enable", "disable", "migrate", "project", "settings"})
+ADMIN_SUBCOMMANDS = frozenset({"init", "install", "uninstall", "enable", "disable", "migrate", "project", "settings", "consent"})
 HARNESS_ADMIN = frozenset({"init"})
 REASON = "only the user runs this, in their own terminal"
 
@@ -62,7 +62,7 @@ _PY_VALUE_OPTS = frozenset({"-X", "-W", "-Q", "--check-hash-based-pycs"})
 _RUNNERS = frozenset({"uv", "uvx", "pipx", "poetry", "pdm", "hatch", "pipenv", "conda", "mamba", "micromamba",
                       "pixi", "rye", "call", "start", "start-process", "saps", "invoke-command", "icm", "wsl"})
 
-_ADMIN_WORDS = r"(?:init|install|uninstall|enable|disable|migrate|project|settings)"
+_ADMIN_WORDS = r"(?:init|install|uninstall|enable|disable|migrate|project|settings|consent)"
 # semgate subcommands that are not admin commands: `semgate doctor | grep
 # install` or `semgate feedback deny "npm install"` is not an admin command.
 _OTHER_SUBS = (r"(?:feedback|trust|report|doctor|status|demo|judge|replay|eval|ledger|telemetry|telemetry-send|serve"
@@ -79,7 +79,8 @@ ADMIN_TEXT_RE = re.compile(
     r"[^\n]*?(?<![\w.-])" + _ADMIN_WORDS + r"(?![\w.-])"
     r"|(?<![\w.-])" + _ADMIN_WORDS + r"(?![\w.-])[^\n]*\|[^\n]*(?<![\w./\\-])semgate(?![\w/\\.-])"
     r"|\bsemgate\.init_antigravity\b|\bfrom\s+semgate\s+import\b[^\n]*\binit_antigravity\b"
-    r"|\brunpy\b[^\n]*\bsemgate\b",
+    r"|\brunpy\b[^\n]*\bsemgate\b|\bsemgate\.privacyconsent\b"
+    r"|\bfrom\s+semgate\s+import\b[^\n]*\bprivacyconsent\b",
     re.IGNORECASE)
 # In python/node code the command runs: semgate's CLI or installer module
 # together with an admin word as a string, or an argv list that runs one

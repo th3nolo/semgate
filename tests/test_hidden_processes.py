@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import semgate
+import pytest
 from semgate import proc
 
 PKG = Path(semgate.__file__).resolve().parent
@@ -76,18 +77,19 @@ def test_the_python_check_catches_a_direct_call():
     assert list(_direct_calls('"""mentions os.system("x") in text"""\n')) == []
 
 
-def test_proc_run_adds_create_no_window_on_windows(monkeypatch):
+@pytest.mark.parametrize("factory,method", [(proc.run, "run"), (proc.popen, "Popen")])
+def test_proc_run_adds_create_no_window_on_windows(monkeypatch, factory, method):
     seen = {}
 
     def fake_run(args, **kw):
         seen.update(kw)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, method, fake_run)
     monkeypatch.setattr(os, "name", "nt")
-    proc.run(["git", "status"], capture_output=True)
+    factory(["git", "status"], capture_output=True)
     assert seen["creationflags"] & proc.CREATE_NO_WINDOW
     seen.clear()
     monkeypatch.setattr(os, "name", "posix")
-    proc.run(["git", "status"])
+    factory(["git", "status"])
     assert "creationflags" not in seen

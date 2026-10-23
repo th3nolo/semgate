@@ -49,6 +49,18 @@ class KeyUnavailable(Exception):
     """No key could be read or created (lock timeout, OS error)."""
 
 
+def read_existing_key(path: Path) -> bytes:
+    """Read-only lookup: never create, repair or use a cached former key."""
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(KEY_BYTES + 1)
+    except OSError as exc:
+        raise KeyUnavailable("key unavailable") from exc
+    if len(data) != KEY_BYTES:
+        raise KeyUnavailable("invalid key length")
+    return data
+
+
 def key_path(config: Mapping[str, Any]) -> Path:
     value = config.get("secret_exposures") if isinstance(config.get("secret_exposures"), Mapping) else {}
     if value.get("key_file"):

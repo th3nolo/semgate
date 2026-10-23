@@ -28,9 +28,11 @@ windows: ^symlinks not permitted here$
 windows: ^symlink creation not permitted on this platform$
 windows: ^this machine does not allow creating a symlink$
 windows: ^symlinks not available$
+windows: ^symlink privilege unavailable$
 windows: ^cannot create a link here: \[WinError 1314\] A required privilege is not held by the client
 # POSIX-only behaviour tested on Linux/macOS.
 windows: ^POSIX file mode$
+windows: ^POSIX directory descriptors$
 windows: ^needs bash and curl \(the script is run on Linux/macOS\)$
 # The SWE row cache (evals/data/, gitignored) exists only in the main checkout.
 any: ^SWE row cache absent \(git-ignored, MAIN repo only\)$
@@ -44,3 +46,16 @@ wsl,posix: ^tomllib needs Python 3\.11\+$
 # Windows-only behaviour tested on Windows.
 wsl,posix: ^Windows file names ignore case$
 wsl,posix: ^backslashes are escapes in bash; the skill writes forward slashes$
+# The real-kernel worker suite needs a Linux bubblewrap; it runs in the WSL copy
+# only when that copy has one, and skips everywhere else.
+any: ^requires existing Linux bubblewrap >=0\.12\.0$
+# A supported worker may lack either explicitly optional, pre-existing fixture;
+# the local helper does not install uv or provision a case-insensitive mount.
+wsl,posix: ^optional existing Linux uv executable$
+wsl,posix: ^optional case-insensitive fixture parent$
+# PowerShell parsing is exercised on Windows; POSIX/WSL may lack that optional
+# external runtime. Windows must retain the native parser check.
+wsl,posix: ^PowerShell parser unavailable; this check is exercised on Windows CI$
+# The directory-junction cases are Windows-only: a junction is a Windows name
+# surrogate, and the POSIX filesystems have no equivalent.
+wsl,posix: ^Windows directory junctions$

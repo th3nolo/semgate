@@ -44,6 +44,7 @@ the judge fails closed (an allow becomes an ask).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -214,6 +215,41 @@ def _under(child: str, parent: str) -> bool:
     return bool(child and parent) and (child == parent or child.startswith(parent.rstrip(os.sep) + os.sep))
 
 
+def _private_scope(record: Mapping[str, Any], key: bytes, command: str, want_dir: str,
+                   tool: str, session_id: str) -> Optional[tuple[str, str, str]]:
+    """Recover only identities verified against operator-supplied scope hints."""
+    from .ledger import private_identity
+
+    def matches(field: str, value: str) -> bool:
+        saved = record.get("privacy_" + field + "_id")
+        return (isinstance(saved, str) and saved.isascii()
+                and hmac.compare_digest(saved, private_identity(key, field, value)))
+
+    if not matches("command", command):
+        return None
+    env = record.get("envelope") or {}
+    action = env.get("action") or {}
+    environment = env.get("environment") or {}
+    env_tool = tool if record.get("privacy_tool_unattributed") else str(action.get("tool", ""))
+    sid = session_id if record.get("privacy_session_unattributed") else str(environment.get("session_id", ""))
+    if (not env_tool or not sid or not matches("tool", env_tool) or not matches("session", sid)
+            or (tool and env_tool.lower() != tool.lower()) or (session_id and sid != session_id)):
+        return None
+    if want_dir:
+        # A CLI invoked in a subdirectory still binds to the original root.
+        root = want_dir
+        while not matches("project", root):
+            parent = os.path.dirname(root)
+            if parent == root:
+                return None
+            root = parent
+    else:
+        root = norm_root(str(environment.get("project_root") or environment.get("cwd") or ""))
+        if not root or not matches("project", root):
+            return None
+    return env_tool, sid, root
+
+
 def blocked_candidates(ledger_path: str, command: str, project_dir: str = "", tool: str = "",
                        session_id: str = "", any_decision: bool = False) -> List[Dict[str, Any]]:
     """Steps in the ledger where this exact command was asked or blocked.
@@ -227,12 +263,19 @@ def blocked_candidates(ledger_path: str, command: str, project_dir: str = "", to
     `project_dir`, when given, must be the judgment's project root or a
     directory inside it. `tool` and `session_id` narrow. A ledger that does
     not exist has no steps."""
-    from .ledger import Ledger
-    if not os.path.isfile(os.path.expanduser(str(ledger_path))):
+    from . import fingerprints, trust
+    path = Path(os.path.expanduser(str(ledger_path)))
+    if not path.is_file():
         return []
-    led = Ledger(ledger_path)
+    try:
+        key = fingerprints.read_existing_key(path.with_name(trust.KEY_NAME))
+    except fingerprints.KeyUnavailable:
+        key = None
+    from .ledger import private_identity
+    private_needle = private_identity(key, "command", command).encode("ascii") if key else b""
     needle = filelock.json_needle(command)
-    records = filelock.read_jsonl(led.path, keep=lambda line: needle in line or b'"host_response"' in line).records
+    records = filelock.read_jsonl(path, keep=lambda line: needle in line or (private_needle and private_needle in line)
+                                 or b'"host_response"' in line).records
     host_block: Dict[tuple, str] = {}
     for r in records:
         if r.get("record_type") == "host_response":
@@ -248,18 +291,24 @@ def blocked_candidates(ledger_path: str, command: str, project_dir: str = "", to
         env = r.get("envelope") or {}
         action = env.get("action") or {}
         args = action.get("arguments") or {}
-        if _command_of(args) != command:
-            continue
-        env_tool = str(action.get("tool", ""))
-        if tool and env_tool.lower() != tool.lower():
-            continue
-        environment = env.get("environment") or {}
-        sid = str(environment.get("session_id", ""))
-        if not sid or (session_id and sid != session_id):
-            continue
-        root = norm_root(str(environment.get("project_root") or environment.get("cwd") or ""))
-        if not root or (want_dir and not _under(want_dir, root)):
-            continue
+        if r.get("privacy_minimized"):
+            scope = _private_scope(r, key, command, want_dir, tool, session_id) if key else None
+            if scope is None:
+                continue
+            env_tool, sid, root = scope
+        else:
+            if _command_of(args) != command:
+                continue
+            env_tool = str(action.get("tool", ""))
+            if tool and env_tool.lower() != tool.lower():
+                continue
+            environment = env.get("environment") or {}
+            sid = str(environment.get("session_id", ""))
+            if not sid or (session_id and sid != session_id):
+                continue
+            root = norm_root(str(environment.get("project_root") or environment.get("cwd") or ""))
+            if not root or (want_dir and not _under(want_dir, root)):
+                continue
         decision = r.get("decision") or {}
         judged = str(decision.get("decision", ""))
         host = host_block.get((sid, str(r.get("judgment_id", ""))), "")

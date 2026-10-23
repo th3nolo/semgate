@@ -101,6 +101,18 @@ def features(votes: Iterable[Mapping[str, Any]]) -> Dict[str, float]:
     return out
 
 
+def _feedback_matches(judgment: Mapping[str, Any], feedback: Mapping[str, Any], action_key: Optional[str]) -> bool:
+    """An explicit judgment/occurrence binding takes priority over an action key."""
+    binding = feedback.get("bound_to")
+    if binding is not None:
+        return (isinstance(binding, Mapping) and bool(binding.get("judgment_id"))
+                and binding.get("judgment_id") == judgment.get("judgment_id")
+                and bool(binding.get("asked_at")) and binding.get("asked_at") == judgment.get("ts"))
+    # Private commands cannot be reconstructed from minimized text. Legacy
+    # unbound feedback retains the old action-key join only for plain records.
+    return not judgment.get("privacy_minimized") and feedback.get("action_key") == action_key
+
+
 def collect(ledger_path: str, history_path: str = "", feedback_path: str = "") -> List[Dict[str, Any]]:
     """Samples: {ts, judgment_id, reason_code, features, approved, source}."""
     from .feedback import _key as feedback_key
@@ -144,8 +156,8 @@ def collect(ledger_path: str, history_path: str = "", feedback_path: str = "") -
         else:
             env = j.get("envelope") or {}
             action = env.get("action") or {}
-            key = feedback_key(str(action.get("tool", "")), action.get("arguments") or {})
-            after = [f for f in feedback if f.get("action_key") == key and (ts is None or (_epoch(f.get("ts")) or 0) >= ts)]
+            key = None if j.get("privacy_minimized") else feedback_key(str(action.get("tool", "")), action.get("arguments") or {})
+            after = [f for f in feedback if _feedback_matches(j, f, key) and (ts is None or (_epoch(f.get("ts")) or 0) >= ts)]
             if after:
                 label, source = str(after[0].get("decision")) == "allow", "feedback"
             elif jid in history_answer:

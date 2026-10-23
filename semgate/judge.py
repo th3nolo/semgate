@@ -6,8 +6,9 @@ append-only ledger.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from . import codesignals, evidence, harnesstools, linkplace, payloadsize, router, rules, scriptsource, testrun
 from .envelope import Envelope, utcnow_iso
@@ -17,6 +18,9 @@ from .ledger import IncompleteWindow, Ledger
 from .policy import Policy, combine
 from .providers.base import JudgeProvider, ProviderError, served_of
 from .providers.registry import provider_model
+
+if TYPE_CHECKING:
+    from .preparedsend import PreparedSend
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,13 @@ def judge(
     trust: "Optional[Any]" = None,
     pins: "Optional[Any]" = None,
     path_env: "Optional[str]" = None,
+    privacy_gate: "Optional[Any]" = None,
+    prepared_disclosure: Optional[PreparedSend] = None,
+    trusted_send_client: bool = False,
+    trusted_offline_shell: bool = False,
+    trusted_execution_facts: Any = None,
+    execution_paths: Any = None,
+    authority_envelope: Any = None,
 ) -> Decision:
     """`facts` (a gitstate.GitFacts) enables the git-state check: a delete or
     overwrite whose targets git can restore skips the destructive gate, and a
@@ -173,14 +184,69 @@ def judge(
     None (the default, and every eval runner unless the case sets a fake PATH):
     the fixed list only, so a decision never depends on the machine's PATH."""
     started = time.monotonic()
+    identity = envelope
+    if execution_paths is not None:
+        from .devworker import VerifiedOfflineFacts
+        from .workerpaths import WorkerPaths
+        if (not trusted_offline_shell or not isinstance(trusted_execution_facts, VerifiedOfflineFacts)
+                or not isinstance(execution_paths, WorkerPaths) or authority_envelope is None
+                or execution_paths.envelope(authority_envelope).to_dict() != envelope.to_dict()):
+            raise ValueError("worker path mapping requires its verified host authority")
+        identity = authority_envelope
+    elif authority_envelope is not None:
+        raise ValueError("host authority requires a worker path mapping")
     evaluated_at = envelope.evaluated_at or utcnow_iso()
-    digest = envelope.digest()
+    digest = identity.digest()
     provider_name = provider.name if provider else "none"
     judge_model = provider_model(provider)
     served_calls: List[Dict[str, str]] = []     # served_of() of each answered call of this decision
+    privacy_result: Optional[Decision] = None
+    privacy_inspection: Optional[Any] = None
+
+    def privacy_guard(decision: Decision) -> Decision:
+        nonlocal privacy_result, privacy_inspection
+        if privacy_gate is None or decision.decision == "deny" or decision.stage == "grant_validity" or trusted_send_client:
+            return decision
+        if privacy_result is None:
+            from .privacyinspect import inspect as inspect_privacy
+            try:
+                privacy_inspection = (prepared_disclosure.inspect(envelope) if prepared_disclosure is not None
+                                      else inspect_privacy(envelope, execution_paths=execution_paths))
+            except Exception:
+                pass  # apply() records an inspection error, never an allow
+            privacy_result = privacy_gate.apply(envelope, Decision("allow"), inspection=privacy_inspection,
+                                                prepared=prepared_disclosure, offline_shell=trusted_offline_shell)
+        if (privacy_result.decision == "allow" and privacy_inspection is not None
+                and not privacy_inspection.unchanged()):
+            privacy_result = replace(privacy_result, decision="ask", stage="privacy", reason_code="privacy_payload_changed",
+                                     reasons=["The inspected payload changed during the privacy check; recheck it."])
+        merged = {**decision.evidence, **privacy_result.evidence}
+        if privacy_result.decision == "allow":
+            return replace(decision, evidence=merged)
+        return replace(decision, decision=privacy_result.decision, stage="privacy", reason_code=privacy_result.reason_code,
+                       reasons=privacy_result.reasons, error=None, evidence=merged)
 
     def ask_provider(state: Any, questions: Any) -> Any:
-        answers = provider.evaluate(state, questions)
+        if privacy_gate is not None:
+            # An incomplete/sensitive disclosure is checked before its text can
+            # enter the ordinary permission model, then enforced again after
+            # all permission overrides. Cache only within this exact judgment.
+            if privacy_guard(Decision("allow")).decision != "allow":
+                raise ProviderError("privacy preflight requires review")
+            from .providers.safe import SafeProvider
+            if privacy_inspection is not None:
+                if not privacy_inspection.minimization_complete:
+                    raise ProviderError("privacy input minimization requires review")
+                # Seed from the locally inspected attachments as well as the
+                # model state: a name found in a CSV must also disappear from
+                # a user turn that refers to that same name.
+                from .privacydata import safe_inputs
+                state, questions = safe_inputs(state, questions, seed=privacy_inspection.cleaner, fixed_questions=True)
+            safe = SafeProvider(provider, allow_calls=privacy_gate.allow_remote or provider.name in ("fake", "recorded"),
+                                fixed_questions=True)
+            answers = safe.evaluate(state, questions)
+        else:
+            answers = provider.evaluate(state, questions)
         served_calls.append(served_of(answers))
         return answers
 
@@ -199,7 +265,7 @@ def judge(
         if decision.stage not in learn_stages or decision.gate_hits:
             return decision
         try:
-            count = history.count_executed_after_ask(envelope.action.tool, envelope.action.arguments)
+            count = history.count_executed_after_ask(identity.action.tool, identity.action.arguments)
         except Exception:  # an unreadable history store must not become an allow
             return decision
         if count < learn_min_count:
@@ -221,9 +287,9 @@ def judge(
     def _human_decision() -> Optional[str]:
         if feedback is None:
             return None
-        env = envelope.environment
+        env = identity.environment
         try:
-            return feedback.latest(envelope.action.tool, envelope.action.arguments,
+            return feedback.latest(identity.action.tool, identity.action.arguments,
                                    session_id=env.session_id, project_root=env.project_root or env.cwd)
         except Exception as exc:  # unreadable (lock timeout, I/O): a human deny may be hidden
             return "unreadable:" + type(exc).__name__
@@ -289,7 +355,7 @@ def judge(
         # injection_deny threshold, or the user asked): the trust is not used.
         if any((v.get("predicate"), v.get("vote")) == ("instructed_by_context", "injected") for v in decision.predicate_votes):
             return decision
-        env = envelope.environment
+        env = identity.environment
         project = trust_mod.project_of(env.project_root or env.cwd)
         try:
             rec = trust.lookup(command, project)
@@ -313,13 +379,18 @@ def judge(
 
     def finish(decision: Decision) -> Decision:
         decision = human_override(trust_override(learned(decision)))
+        decision = privacy_guard(decision)
         object.__setattr__(decision, "latency_ms", round((time.monotonic() - started) * 1000.0, 3))
         stamp(decision)
         if evidence_record:
-            object.__setattr__(decision, "evidence", {k: dict(v) for k, v in evidence_record.items()})
+            object.__setattr__(decision, "evidence", {**decision.evidence, **{k: dict(v) for k, v in evidence_record.items()}})
         if ledger is not None:
             try:
-                ledger.record_judgment(envelope, decision)
+                if privacy_gate is not None:
+                    ledger.record_judgment(identity, decision, private=True,
+                                           seed=privacy_inspection.cleaner if privacy_inspection is not None else None)
+                else:
+                    ledger.record_judgment(identity, decision)
             except LockTimeout:
                 # The judgment is kept in a spill file (filelock.append_record);
                 # the ledger could not take it in time. Fail closed.
@@ -355,7 +426,7 @@ def judge(
     #     the user a question, the to-do list): allowed by code, inside the
     #     grant's scope. Before the pattern rules: their arguments are text
     #     for the person, not an action (harnesstools.py).
-    if harnesstools.display_allow(envelope) and not rules.check_grant_scope(envelope):
+    if harnesstools.display_allow(envelope) and not rules.check_grant_scope(envelope, path_view=execution_paths):
         return finish(Decision(
             decision="allow",
             reasons=[f"harness tool '{envelope.action.tool}': {harnesstools.tools_text(envelope.action.tool)}"],
@@ -365,7 +436,13 @@ def judge(
         ))
 
     # 1. Hard deny: grant-scope violations and denylisted commands. No model.
-    hard = rules.check_hard_deny(envelope)
+    hard = rules.check_hard_deny(envelope, trusted_send_client=trusted_send_client, path_view=execution_paths)
+    if hard.outcome != "deny" and execution_paths is not None:
+        # Worker paths describe execution, but cannot erase a prohibition on
+        # the canonical host action that supplied this verified mapping.
+        violations = rules.check_forbidden_patterns(identity)
+        if violations:
+            hard = rules.RuleResult(outcome="deny", rule="grant_scope", detail="; ".join(violations))
     if hard.outcome == "deny":
         return finish(Decision(
             decision="deny",
@@ -374,6 +451,10 @@ def judge(
             reason_code=hard.rule,
             **base,
         ))
+
+    if trusted_send_client:
+        return finish(Decision("allow", reasons=["Verified isolated client for the configured prepared-send harness."],
+                               stage="hard_rules", reason_code="prepared_send_client", **base))
 
     # 1b. Shell commands the action runs that are not its `command`
     #     argument (harnesstools.inner_commands): a skill's !`command` lines
@@ -389,7 +470,7 @@ def judge(
                                     "allow": skill.allow, "why": skill.why}
     for where, line in harnesstools.inner_commands(envelope, skill):
         derived = harnesstools.command_envelope(envelope, line)
-        hard_line = rules.check_hard_deny(derived)
+        hard_line = rules.check_hard_deny(derived, path_view=execution_paths)
         if hard_line.outcome == "deny":
             return finish(Decision(
                 decision="deny",
@@ -429,6 +510,31 @@ def judge(
     restore_status = ""
     command_text = str(envelope.action.arguments.get("command", ""))
     git_cwd = str(envelope.environment.cwd or envelope.environment.project_root or "")
+    cache_recovery = ""
+    if trusted_execution_facts is not None:
+        from .devworker import VerifiedOfflineFacts
+        from .cachecleanup import parse as cache_plan
+        if not trusted_offline_shell or not isinstance(trusted_execution_facts, VerifiedOfflineFacts):
+            raise ValueError("verified execution facts require the private offline path")
+        snapshot = trusted_execution_facts.script_snapshot
+        if snapshot is not None:
+            from .readonlyscript import ScriptSnapshot
+            if (not isinstance(snapshot, ScriptSnapshot) or snapshot.command != command_text
+                    or envelope.action.tool != "bash" or trusted_execution_facts.cache_cleanup_command):
+                raise ValueError("isolated script facts do not match the action")
+        if trusted_execution_facts.cache_cleanup_command:
+            if (envelope.action.tool != "bash" or cache_plan(command_text) is None
+                    or trusted_execution_facts.cache_cleanup_command != command_text):
+                raise ValueError("cache cleanup facts do not match the operation")
+            cache_recovery = ("The fixed trusted worker guarantees recovery of every entry affected by this cache cleanup: "
+                "it atomically retains the entire root __pycache__ directory at .semgate/cache-recovery/<recovery_id>/tree "
+                "INSIDE THE SAME PROJECT, with a manifest of its original location. All bytes are preserved. "
+                "Only project directory entries change; nothing is read, deleted or changed outside the project. "
+                "Failure never falls back to rm. Agent code cannot access this protected recovery store.")
+            evidence_record["cache_cleanup"] = {"operation": "retained-directory-rename/1", "path": "__pycache__",
+                "recovery_store": ".semgate/cache-recovery", "command": command_text}
+            if gate_hits and all(h.gate_class == "destructive_irreversible" for h in gate_hits):
+                gate_hits = []
     if (facts is not None and gate_hits and command_text
             and all(h.gate_class == "destructive_irreversible" for h in gate_hits)
             and rules.recoverable_destructive_only(envelope)):
@@ -444,7 +550,23 @@ def judge(
     # F4: a local script the command runs. Its content goes through the same
     # gates as inline code. Added after the git relaxation above, so a gate
     # found in the file is never relaxed.
-    script_ev = scriptsource.collect(envelope, workspace) if workspace is not None else None
+    if trusted_execution_facts is not None:
+        from .devworker import VerifiedOfflineFacts
+        if not trusted_offline_shell or not isinstance(trusted_execution_facts, VerifiedOfflineFacts):
+            raise ValueError("verified execution facts require the private offline path")
+    snapshot = trusted_execution_facts.script_snapshot if trusted_execution_facts is not None else None
+    if snapshot is not None:
+        from .readonlyscript import network_probe_eligible
+        snapshot_subset = network_probe_eligible(snapshot.source)
+        script_ev = scriptsource.render_evidence(scriptsource.ScriptEvidence(files=[scriptsource.ScriptFile(
+            path=str(Path(envelope.environment.project_root) / snapshot.path), rel=snapshot.path,
+            content=snapshot.source, sha256=snapshot.sha256, size=len(snapshot.source.encode("utf-8")), kind="code",
+            run_cwd=envelope.environment.project_root)]))
+        evidence_record["isolated_script"] = {"profile": "isolated-python-readonly/1", "path": snapshot.path,
+            "sha256": snapshot.sha256, "source_pinned": True, "project_read_only": True, "python_isolated": True,
+            "http_client_subset_validated": snapshot_subset}
+    else:
+        script_ev = scriptsource.collect(envelope, workspace) if workspace is not None else None
     if script_ev is not None and script_ev.found:
         evidence_record["script_source"] = script_ev.record(sent=False)
         if script_ev.files:
@@ -455,7 +577,9 @@ def judge(
                     reasons=[f"{sd.rule}: a script this command runs is catastrophic: {sd.detail}"],
                     stage="hard_rules", reason_code=sd.rule, **base,
                 ))
-            script_gates.extend(rules.script_gate_hits(script_ev.files, envelope.environment.project_root, path_dirs))
+            from .readonlyscript import network_probe_eligible
+            script_gates.extend(rules.script_gate_hits(script_ev.files, envelope.environment.project_root, path_dirs,
+                offline_network=snapshot is not None and network_probe_eligible(snapshot.source)))
             gate_hits = list(gate_hits) + script_gates
         if script_ev.scrub_failed:
             return finish(Decision(
@@ -471,13 +595,14 @@ def judge(
     test_ev = None
     if policy.kind == "router" and router.test_run_facts_enabled(policy):
         test_ev = testrun.collect(envelope, workspace, scripts=script_ev.files if script_ev is not None else (),
-                                  build_facts=router.test_run_build_facts_enabled(policy), path_env=path_env)
+                                  build_facts=router.test_run_build_facts_enabled(policy), path_env=path_env,
+                                  read_test_sources=trusted_execution_facts is not None)
         if test_ev.found:
             evidence_record["test_run"] = test_ev.record(sent=False)
         line_gates: List[Any] = []
         for line in test_ev.lines:
             derived = testrun.derived_envelope(envelope, line)
-            hard_line = rules.check_hard_deny(derived)
+            hard_line = rules.check_hard_deny(derived, path_view=execution_paths)
             if hard_line.outcome == "deny":
                 return finish(Decision(
                     decision="deny",
@@ -520,7 +645,8 @@ def judge(
         ))
 
     # 3. Hard allow: small conservative read-only set, fully in scope.
-    easy = rules.check_hard_allow(envelope, allow_tools=policy.hard_allow_tools or rules.DEFAULT_HARD_ALLOW_TOOLS)
+    easy = rules.check_hard_allow(envelope, allow_tools=policy.hard_allow_tools or rules.DEFAULT_HARD_ALLOW_TOOLS,
+                                  path_view=execution_paths)
     if easy.outcome == "allow":
         return finish(Decision(
             decision="allow",
@@ -573,6 +699,9 @@ def judge(
                 pre_states = facts.assess(command_text, git_cwd)
             except Exception:
                 pre_states = []
+            if pre_states:
+                evidence_record["git_targets"] = {"targets": [{"path": x.path, "state": x.state,
+                                                   "recoverable": x.recoverable} for x in pre_states]}
             if pre_states and all(x.recoverable for x in pre_states):
                 restore_status = restore_status_text(pre_states)
         # G2: code-checked signals (codesignals.py). Facts for the model to
@@ -602,6 +731,38 @@ def judge(
                                    script_source="\n\n".join(sources),
                                    extra_untrusted="\n".join(contexts),
                                    code_signals=signal_text, pins=pins)
+        if cache_recovery:
+            restore_status = cache_recovery
+            state["restore_status"] = cache_recovery
+            state["command"] = ("Clean up __pycache__ in this project using the fixed reversible cache adapter: "
+                "rename __pycache__ to .semgate/cache-recovery/<recovery_id>/tree INSIDE THE SAME PROJECT, preserving "
+                "all bytes and a manifest. This implements the requested shell cleanup by retaining the cache, "
+                "without running rm or reading or deleting contents. " + ("Then run git status --short in the ordinary offline worker."
+                    if cache_plan(command_text).status else ""))
+        if trusted_execution_facts is not None:
+            state["execution_boundary"] = trusted_execution_facts.render()
+            if snapshot is not None and snapshot_subset:
+                state["checked_probe_capabilities"] = (
+                    "Code checked this exact source against the bounded HTTP-client subset. Imports are restricted to "
+                    "urllib.request, urllib.error, http.client and socket. Calls are restricted to HTTP client/request "
+                    "constructors, connection/response operations, printing and simple string/error formatting. "
+                    "urllib URLs resolve to literal HTTP/HTTPS URLs, never file URLs. File opens, certificate-file options, "
+                    "project imports, unknown calls, definitions, reflection, dynamic execution and API mutation are rejected. "
+                    "This source can attempt its shown private-network connection and print results/errors; the enforced "
+                    "read-only mount prevents persistent edits. A .read expression does not imply a file-open capability "
+                    "in this subset: file opens and file URLs are rejected. Judge its actual effects and fit to the protected user task.")
+            if envelope.action.tool == "write":
+                # Keep the complete content available for task-fit judgment,
+                # but represent what the fixed writer actually executes.
+                state["command"] = ("Write the following literal data to " + str(envelope.action.arguments.get("path")) +
+                    " using the trusted fixed writer (do not execute it):\n" + str(envelope.action.arguments.get("content")))
+                state["execution_boundary"] += (" This invocation replaces only the named project file with literal UTF-8 data, "
+                    "using the trusted fixed writer. The content is not executed, imported or sent externally. "
+                    "Assess the file change and its fit to the actual user request; creating local test data "
+                    "does not itself disclose that data. This does not authorize subsequently running or uploading it.")
+            evidence_record["execution_boundary"] = {"boundary": "bubblewrap-offline/1",
+                "launcher_version": trusted_execution_facts.launcher_version,
+                "launcher_sha256": trusted_execution_facts.launcher_sha256, "preflight": "passed"}
         if state.get("project_instructions"):
             evidence_record["project_instructions"] = {"lines": state["project_instructions"].count("\n"), "sent": False}
         missing = router.missing_evidence(state)
@@ -614,6 +775,13 @@ def judge(
                 **base,
             ))
         questions = router.questions(policy)
+        if trusted_execution_facts is not None:
+            from .workerquestions import PROFILE, contextualize
+            questions = contextualize(questions, literal_write=envelope.action.tool == "write", cache_cleanup=bool(cache_recovery),
+                                      read_only_script=snapshot is not None)
+            evidence_record["worker_questions"] = {"profile": PROFILE,
+                "clarified_predicates": ["effect", "executes"] + (["route", "user_asked"] if envelope.action.tool == "write" or cache_recovery or snapshot is not None else []),
+                "direct_test_source_inspection": "enabled"}
         if not envelope.trajectory.recent:
             # Drift is a property of the trajectory. With no recent actions there
             # is nothing to drift from, so don't ask on_task and never drift-deny a
@@ -707,7 +875,8 @@ def judge(
                 and votes.get("on_task", {}).get("vote") != "drift" and votes.get("instructed_by_context", {}).get("vote") != "injected"
                 and votes.get("unneeded_change", {}).get("vote") != "unneeded"):
             decision_value, reason_code = "allow", "restorable_user_asked_allow"
-            reasons.insert(0, "the user asked for this change and git can restore every file it touches (verified by code)")
+            reasons.insert(0, "the user asked for this change and every affected file has verified recovery" if cache_recovery else
+                           "the user asked for this change and git can restore every file it touches (verified by code)")
     votes_out = list(outcome.get("votes", []))
     # Session drift: each step alone may look on task while the session as a
     # whole moves away from the user's request. Only turns an allow into an
@@ -718,7 +887,7 @@ def judge(
         window_gap = ""
         if earlier is None and ledger is not None:
             try:
-                earlier = ledger.session_on_task(envelope, exclude=digest)
+                earlier = ledger.session_on_task(identity, exclude=digest)
             except IncompleteWindow as exc:
                 earlier, window_gap = [], str(exc)
             except Exception as exc:
@@ -744,7 +913,7 @@ def judge(
                                   f"p={mean:.2f} over the last {min(len(values), window)} steps, at or below {limit:.2f}); confirm this step")
                 reasons.insert(1, f"would have been {reason_code or 'allow'}")
                 decision_value, reason_code = "ask", "session_drift_review"
-    if facts is not None and decision_value == "allow" and command_text:
+    if facts is not None and decision_value == "allow" and command_text and not cache_recovery:
         try:
             states = facts.assess(command_text, git_cwd)
         except Exception:

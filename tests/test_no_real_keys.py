@@ -14,17 +14,17 @@ from semgate.providers import keys
 
 
 def test_no_key_is_found_in_process():
-    for name in ("TYPESAFE_API_KEY", "OPENROUTER_API_KEY"):
+    for name in ("TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "SUBQ_API_KEY"):
         assert keys.find_key(name) == ("", ""), name
     assert all(label != keys.CHECKOUT_LABEL for label, _ in keys.env_files())
 
 
 def test_no_key_is_found_in_a_subprocess():
     code = ("from semgate.providers import keys; "
-            "print(repr([keys.find_key(n)[1] for n in ('TYPESAFE_API_KEY', 'OPENROUTER_API_KEY')]))")
+            "print(repr([keys.find_key(n)[1] for n in ('TYPESAFE_API_KEY', 'OPENROUTER_API_KEY', 'SUBQ_API_KEY')]))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=dict(os.environ))
     assert out.returncode == 0, out.stderr
-    assert out.stdout.strip() == "['', '']", out.stdout
+    assert out.stdout.strip() == "['', '', '']", out.stdout
 
 
 def test_the_skip_only_drops_the_real_checkout_file(tmp_path, monkeypatch):

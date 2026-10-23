@@ -66,7 +66,8 @@ def _temp_home_and_cwd(monkeypatch, tmp_path_factory):
     for var in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(var, str(home))
     for var in ("SEMGATE_CONFIG", "SEMGATE_ANTIGRAVITY_CONFIG", "SEMGATE_LEDGER_FILE",
-                "SEMGATE_TYPESAFE_API_KEY", "SEMGATE_OPENROUTER_API_KEY", "TYPESAFE_API_KEY", "OPENROUTER_API_KEY"):
+                "SEMGATE_TYPESAFE_API_KEY", "SEMGATE_OPENROUTER_API_KEY", "SEMGATE_SUBQ_API_KEY",
+                "TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "SUBQ_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     # The checkout's real .env holds the developer's keys: no test and no hook
     # subprocess may read it (tests/test_no_real_keys.py checks this).
