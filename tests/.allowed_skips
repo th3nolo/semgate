@@ -28,6 +28,7 @@ windows: ^symlinks not permitted here$
 windows: ^symlink creation not permitted on this platform$
 windows: ^this machine does not allow creating a symlink$
 windows: ^symlinks not available$
+windows: ^symlink privilege unavailable$
 windows: ^cannot create a link here: \[WinError 1314\] A required privilege is not held by the client
 # POSIX-only behaviour tested on Linux/macOS.
 windows: ^POSIX file mode$
@@ -52,6 +53,9 @@ any: ^requires existing Linux bubblewrap >=0\.12\.0$
 # the local helper does not install uv or provision a case-insensitive mount.
 wsl,posix: ^optional existing Linux uv executable$
 wsl,posix: ^optional case-insensitive fixture parent$
+# PowerShell parsing is exercised on Windows; POSIX/WSL may lack that optional
+# external runtime. Windows must retain the native parser check.
+wsl,posix: ^PowerShell parser unavailable; this check is exercised on Windows CI$
 # The directory-junction cases are Windows-only: a junction is a Windows name
 # surrogate, and the POSIX filesystems have no equivalent.
 wsl,posix: ^Windows directory junctions$
