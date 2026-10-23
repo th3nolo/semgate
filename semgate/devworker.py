@@ -47,6 +47,28 @@ MAX_OUTPUT = 16384
 PROTECTED_PROJECT_NAMES = frozenset({".semgate", ".codex", ".agents", ".git", ".venv"})
 _METADATA_NAMES = (".semgate", ".codex", ".agents")
 _READ_ONLY_PROJECT_NAMES = PROTECTED_PROJECT_NAMES - frozenset(_METADATA_NAMES)
+_SYSTEM_BINDS = ("/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc/hosts", "/etc/nsswitch.conf",
+                 "/etc/resolv.conf", "/etc/localtime", "/etc/ssl")
+
+
+def _system_sources() -> tuple[Path, ...]:
+    return tuple(Path(name) for name in _SYSTEM_BINDS if Path(name).exists())
+
+
+def _require_hidden_authority(authority: list[str], sources: tuple[Path, ...]) -> None:
+    """A read-only source is still readable; refuse known authority overlap."""
+    try:
+        for name in authority:
+            path = Path(name).expanduser().absolute()
+            for source in sources:
+                for candidate in (path, path.resolve()):
+                    for exposed in (source.absolute(), source.resolve()):
+                        if candidate.is_relative_to(exposed) or exposed.is_relative_to(candidate):
+                            raise ValueError("operator authority would be readable through a worker mount")
+                if path.exists() and source.is_file() and path.samefile(source):
+                    raise ValueError("operator authority aliases a readable worker mount")
+    except OSError:
+        raise ValueError("operator authority visibility could not be verified") from None
 
 
 def _reserve_metadata(project: Path) -> None:
@@ -432,12 +454,29 @@ class OfflineWorker:
             project_name = str(project_path)
             argv = [sys.executable, "-I", str(worker_path)]
         hidden = []
+        authority = []
+        drive_roots = {}
+        def authority_name(path):
+            if self.settings["backend"] != "wsl-bubblewrap":
+                return str(path)
+            if path.is_relative_to(project_path):
+                return project_name.rstrip("/") + "/" + path.relative_to(project_path).as_posix()
+            # Query the configured distro's drive mapping once, rather than
+            # spawning wsl.exe for every state/key sidecar on the same drive.
+            if re.fullmatch(r"[A-Za-z]:", path.drive):
+                if path.anchor not in drive_roots:
+                    drive_roots[path.anchor] = linux_path(Path(path.anchor))
+                return drive_roots[path.anchor].rstrip("/") + "/" + path.relative_to(path.anchor).as_posix()
+            return linux_path(path)
         for name in protected:
-            path = Path(name).resolve()
+            lexical = Path(name).expanduser().absolute()
+            path = lexical.resolve()
+            authority.extend(authority_name(p) for p in dict.fromkeys((lexical, path)))
             if path.is_relative_to(project_path):
                 hidden.append(path.relative_to(project_path).as_posix())
         payload = {"project": project_name, **operation, "timeout_s": self.timeout,
                    "tools": self.settings.get("tools", {}), "protected": hidden,
+                   "authority": list(dict.fromkeys(authority)),
                    "bubblewrap": self.settings.get("bubblewrap", "/usr/bin/bwrap"),
                    "bubblewrap_sha256": (expected_facts.launcher_sha256 if expected_facts is not None
                                          else self.settings.get("bubblewrap_sha256"))}
@@ -523,6 +562,12 @@ def execute(payload: dict) -> dict:
     project = Path(payload["project"]).resolve(strict=True)
     if not project.is_dir() or project == Path("/"):
         raise ValueError("invalid worker project")
+    system_sources = _system_sources()
+    authority = list(dict.fromkeys([*payload.get("authority", []),
+                                   *(str(project / p) for p in payload["protected"])]))
+    exposed_sources = (*system_sources, *(Path(p) for p in payload["tools"].values()),
+                       *(project / name for name in (".git", ".venv") if (project / name).exists()))
+    _require_hidden_authority(authority, exposed_sources)
     # DrvFS case aliases can bypass a mount covering .semgate or .git. Test
     # the actual project directory, not a child that may inherit other flags.
     import tempfile
@@ -549,6 +594,7 @@ def execute(payload: dict) -> dict:
         git_layout = workerrepo.layout(project, tuple(str(project / p) for p in payload["protected"]))
     if git_layout is not None:
         git_layout = workerrepo.validate(project, git_layout)
+        _require_hidden_authority(authority, (Path(git_layout["common"]),))
         metadata_audit = audit_write_confinement(Path(git_layout["common"]), read_only=True, masked_roots=frozenset())
         if metadata_audit["unverifiable"]:
             raise IncompleteAuditError(metadata_audit)
@@ -556,13 +602,8 @@ def execute(payload: dict) -> dict:
         if cachecleanup.parse(payload["cache_cleanup"]) is None or "command" in payload or "write" in payload:
             raise ValueError("invalid cache cleanup operation")
     argv = [str(launcher), "--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL"]
-    for name in ("usr", "lib", "lib64", "bin", "sbin"):
-        path = Path("/") / name
-        if path.exists():
-            argv += ["--ro-bind", str(path), str(path)]
-    for name in ("/etc/hosts", "/etc/nsswitch.conf", "/etc/resolv.conf", "/etc/localtime", "/etc/ssl"):
-        if Path(name).exists():
-            argv += ["--ro-bind", name, name]
+    for path in system_sources:
+        argv += ["--ro-bind", str(path), str(path)]
     argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/tools",
              "--ro-bind" if read_only else "--bind", str(project), "/workspace"]
     # A mount point cannot be renamed out of the way from inside the guest.

@@ -846,6 +846,14 @@ execution guard still apply, so a low-confidence decision can require review.
 PreparedSender still checks the exact snapshot, classification contract and
 current consent immediately before sending; worker facts cannot bypass it.
 
+Declared operator configuration, grants, policy and consent/key state must stay
+outside runtime trees exposed read-only to the worker, including `/usr` and
+`/etc/ssl`, and outside configured tool or Git metadata views. Read-only mounts
+preserve reads. The bootstrap refuses known overlapping paths and resolved
+aliases before agent execution; it does not move or rewrite host state.
+This placement check also applies when a project itself is under a shared
+runtime tree. Use an unexposed installation/state location for that profile.
+
 Conventional linked Git worktrees retain read-only Git inspection. The broker
 resolves the worktree's metadata and common repository directory, then supplies
 guest-valid `.git`, `commondir`, and optional per-worktree configuration views.

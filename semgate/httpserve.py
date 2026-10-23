@@ -225,7 +225,7 @@ class HttpGate:
 
     def prepared_allowed(self, authorization: Optional[str], *, operator: bool) -> bool:
         # No legacy shared-token fallback for disclosure authority.
-        if not self.check_token or not self.approve_token or hmac.compare_digest(self.check_token, self.approve_token):
+        if not self.check_token or not self.approve_token or hmac.compare_digest(self.check_token.encode(), self.approve_token.encode()):
             return False
         expected = self.approve_token if operator else self.check_token
         return hmac.compare_digest(self._bearer(authorization).encode(), expected.encode())
