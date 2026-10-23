@@ -347,12 +347,24 @@ class Minimizer:
         raise InputUnsafe("unsupported privacy input type")
 
 
-def safe_inputs(state: Mapping[str, Any], questions: Mapping[str, Any], *, seed: Minimizer | None = None) -> tuple:
+def safe_inputs(state: Mapping[str, Any], questions: Mapping[str, Any], *, seed: Minimizer | None = None,
+                fixed_questions: bool = False) -> tuple:
+    """Minimize data; reserve fixed_questions for trusted application rubrics."""
+    # Application-owned rubrics are control definitions. Untrusted payload
+    # values must not teach their cleaner to rewrite a score, label or type.
+    # Inspect fixed definitions independently and abstain if they themselves
+    # contain detectable sensitive data. Generic dynamic questions keep the
+    # shared state/question minimization contract below.
+    if fixed_questions:
+        _, checked = safe_inputs({}, questions)
+        if checked != questions:
+            raise InputUnsafe("privacy question definition requires review")
     cleaner = deepcopy(seed) if seed is not None else Minimizer()
     cleaner.nodes = 0
     # First collect values throughout the object, then replace them everywhere
     # (including earlier fields that reference a later structured PII field).
     cleaner.clean(state)
-    cleaner.clean(questions)
+    if not fixed_questions:
+        cleaner.clean(questions)
     cleaner.nodes = 0
-    return cleaner.clean(state), cleaner.clean(questions)
+    return cleaner.clean(state), checked if fixed_questions else cleaner.clean(questions)

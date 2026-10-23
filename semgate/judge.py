@@ -240,13 +240,10 @@ def judge(
                 # Seed from the locally inspected attachments as well as the
                 # model state: a name found in a CSV must also disappear from
                 # a user turn that refers to that same name.
-                cleaner = privacy_inspection.cleaner
-                cleaner.nodes = 0
-                cleaner.clean(state)
-                cleaner.clean(questions)
-                cleaner.nodes = 0
-                state, questions = cleaner.clean(state), cleaner.clean(questions)
-            safe = SafeProvider(provider, allow_calls=privacy_gate.allow_remote or provider.name in ("fake", "recorded"))
+                from .privacydata import safe_inputs
+                state, questions = safe_inputs(state, questions, seed=privacy_inspection.cleaner, fixed_questions=True)
+            safe = SafeProvider(provider, allow_calls=privacy_gate.allow_remote or provider.name in ("fake", "recorded"),
+                                fixed_questions=True)
             answers = safe.evaluate(state, questions)
         else:
             answers = provider.evaluate(state, questions)

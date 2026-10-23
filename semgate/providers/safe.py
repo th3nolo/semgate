@@ -8,10 +8,12 @@ from .base import JudgeProvider, PredicateAnswer, ProviderError
 
 
 class SafeProvider(JudgeProvider):
-    def __init__(self, inner: JudgeProvider, *, allow_calls: bool = True, seed: Minimizer | None = None):
+    def __init__(self, inner: JudgeProvider, *, allow_calls: bool = True, seed: Minimizer | None = None,
+                 fixed_questions: bool = False):
         self.inner = inner
         self.allow_calls = allow_calls
         self.seed = seed
+        self.fixed_questions = fixed_questions
         self.name = inner.name
         self.model = getattr(inner, "model", "")
 
@@ -19,7 +21,8 @@ class SafeProvider(JudgeProvider):
         if not self.allow_calls:
             raise ProviderError("privacy: remote calls disabled")
         try:
-            clean_state, clean_questions = safe_inputs(state, questions, seed=self.seed)
+            clean_state, clean_questions = safe_inputs(state, questions, seed=self.seed,
+                                                       fixed_questions=self.fixed_questions)
             return self.inner.evaluate(clean_state, clean_questions)
         except Exception as exc:
             # SDKs and custom transports can echo their entire input/key. Only
@@ -40,7 +43,7 @@ def for_envelope(provider: Any, envelope: Any, *, prepared: Any = None, offline_
         from ..privacyinspect import inspect
         inspection = prepared.inspect(envelope) if prepared is not None else inspect(envelope)
         return SafeProvider(provider, allow_calls=inspection.minimization_complete and (inspection.complete or offline_shell),
-                            seed=inspection.cleaner)
+                            seed=inspection.cleaner, fixed_questions=True)
     except Exception:
         return SafeProvider(provider, allow_calls=False)
 
@@ -52,4 +55,4 @@ def configured(provider: Any, config: Mapping[str, Any]) -> Any:
     from ..privacy import from_config
     gate = from_config(config)
     allow_remote = gate is not None and not gate.problem and gate.allow_remote
-    return SafeProvider(provider, allow_calls=allow_remote or provider.name in ("fake", "recorded"))
+    return SafeProvider(provider, allow_calls=allow_remote or provider.name in ("fake", "recorded"), fixed_questions=True)

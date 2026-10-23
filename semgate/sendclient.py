@@ -18,6 +18,13 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 _NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _ID = re.compile(r"[0-9a-f]{32}\Z")
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+
+
+def _powershell_literal(value: str) -> str:
+    # PowerShell's IsSingleQuote accepts all five delimiters. Doubling each
+    # retains its exact value without opening parent-shell expressions.
+    return "'" + "".join(c * 2 if c in _PS_SINGLE_QUOTES else c for c in value) + "'"
 
 
 def development_invocation(command: str, connection: Path, *, python: Path | None = None) -> str:
@@ -25,7 +32,7 @@ def development_invocation(command: str, connection: Path, *, python: Path | Non
     arguments = [Path(python or sys.executable).as_posix(), "-I", Path(__file__).resolve().as_posix(),
                  "run", command, "--connection", connection.resolve().as_posix()]
     if os.name == "nt":
-        return "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in arguments)
+        return "& " + " ".join(_powershell_literal(arg) for arg in arguments)
     import shlex
     return shlex.join(arguments)
 
@@ -42,9 +49,9 @@ def _development_invocation(command, settings):
         if not command.startswith(left) or not command.endswith(right):
             return False
         quoted = command[len(left):-len(right)]
-        if not re.fullmatch(r"'(?:[^']|'')*'", quoted):
+        if not (quoted.startswith("'") and quoted.endswith("'")):
             return False
-        target = quoted[1:-1].replace("''", "'")
+        target = re.sub("([" + _PS_SINGLE_QUOTES + r"])\1", r"\1", quoted[1:-1])
     else:
         import shlex
         words = shlex.split(command)

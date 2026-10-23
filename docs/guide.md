@@ -271,6 +271,14 @@ pattern and structured-field detection: unlabeled free-text names, addresses,
 health information and other identifying combinations are not comprehensively
 recognized.
 
+Configured permission questions are trusted control definitions: payload values
+cannot rewrite their score levels, choice labels, types or instructions. They
+are inspected separately, and detectable sensitive data in a fixed definition
+requires review instead of a provider call. User and attachment data still use
+the inspection-seeded minimizer. The generic `SafeProvider` default continues
+to minimize dynamic question text together with its state; fixed definitions
+are selected only by the application-owned configured/judgment paths.
+
 `semgate/privacyinspect.py` inspects outgoing inline arguments and explicit
 file references, including curl `@file` / upload arguments and structured
 attachment fields. File inspection is bounded to eight UTF-8 text, JSON,
@@ -638,8 +646,10 @@ inside the worker. For example, the generated POSIX invocation for a simple job 
 /absolute/semgate/.venv/bin/python -I /absolute/semgate/semgate/sendclient.py run 'python3 -m unittest -q' --connection /absolute/project/.semgate/send-client.json
 ```
 
-On Windows, the generator single-quotes every argument and prefixes PowerShell
-`& `. Use that generated spelling with the same interpreter as the hook. Parent
+On Windows, the generator single-quotes every argument, doubles all five ASCII
+and smart single-quote delimiters recognized by PowerShell, and prefixes `& `.
+Verification requires the exact canonical encoding. Use that generated spelling
+with the same interpreter as the hook. Parent
 shell chaining, interpolation or alternative clients are refused; chains inside
 the literal command argument run within the worker. The agent cannot supply a
 backend, project root, environment, tool path or trusted-offline flag through
