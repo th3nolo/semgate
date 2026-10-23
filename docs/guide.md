@@ -454,6 +454,10 @@ Enable this profile in the operator's existing hook/server configuration:
     "enabled": true,
     "task_id": "diagnostics-task-1",
     "project_root": "/absolute/project",
+    "task_context": {
+      "request": "Send the approved diagnostic report from this project.",
+      "expires_at": "2026-10-24T12:00:00Z"
+    },
     "client_file": "/absolute/project/.semgate/send-client.json",
     "consent_store": "/absolute/project/.semgate/consents.json",
     "snapshot_ttl_s": 300,
@@ -481,6 +485,14 @@ and ledger settings. The operator grant must cover the project, exact recipient
 domain and tools used. Keep the Semgate installation and operator configuration
 outside agent write authority. `.semgate` is protected by the existing tool
 hard rules; stronger hostile same-user isolation requires OS controls.
+
+Before starting, replace `task_context.request` with the actual operator task
+and `expires_at` with an appropriate future timezone-aware expiry. The date above
+illustrates the format only. Preparation and dispatch require this active
+binding to the configured task and project; an absent or expired binding fails
+closed. Renewing a task binding does not grant disclosure consent or execution
+approval. [Codex with Semgate-owned execution](#codex-with-semgate-owned-execution)
+uses the same binding.
 
 Start the server with **different** `--token-file` and `--approve-token-file`.
 Keep the operator token outside the agent's allowed filesystem and environment.
@@ -710,8 +722,10 @@ critical section prevents that dispatch. A send already in progress cannot be
 recalled; an uncertain network result is never retried automatically.
 
 Start the prepared broker with the strict profile and `development` settings
-above. Keep operator state and the Semgate installation outside the writable
-project, and use an already-running Ubuntu distribution. Then, from the
+above. Keep operator state, the Semgate installation and the selected Codex
+executable outside the writable project, and use an already-running Ubuntu
+distribution. The runner resolves executable aliases and refuses a target in
+the project before either host subprocess. Then, from the
 Semgate checkout's own installed environment:
 
 Bind the actual human task in the protected broker configuration before

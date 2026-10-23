@@ -564,6 +564,12 @@ def path_within(path: str, prefixes: Tuple[str, ...]) -> bool:
     return False
 
 
+def check_forbidden_patterns(envelope: Envelope) -> List[str]:
+    text = _action_text(envelope)
+    return [f"action matches forbidden pattern '{pattern}'" for pattern in envelope.grant.forbidden_patterns
+            if re.search(pattern, text, re.IGNORECASE)]
+
+
 def check_grant_scope(envelope: Envelope, *, trusted_send_client: bool = False, path_view: Any = None) -> List[str]:
     """Return a list of scope violations; empty list means in scope."""
     grant = envelope.grant
@@ -573,10 +579,7 @@ def check_grant_scope(envelope: Envelope, *, trusted_send_client: bool = False, 
     if grant.allowed_tools and tool not in grant.allowed_tools and "*" not in grant.allowed_tools:
         violations.append(f"tool '{tool}' is not in the grant's allowed_tools")
 
-    text = _action_text(envelope)
-    for pattern in grant.forbidden_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            violations.append(f"action matches forbidden pattern '{pattern}'")
+    violations.extend(check_forbidden_patterns(envelope))
 
     if grant.allowed_path_prefixes:
         own = own_program_words(_command(envelope))

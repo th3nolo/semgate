@@ -93,7 +93,8 @@ def test_managed_ambient_capability_rejects_start(change):
 def test_fresh_runtime_does_not_inherit_host_keys(tmp_path, monkeypatch):
     home = runner.create_home(tmp_path, model="model", base_url="http://127.0.0.1:1234/v1", env_key="MODEL_KEY")
     monkeypatch.setenv("UNRELATED_SECRET", "synthetic-do-not-inherit")
-    client = runner.CodexRunner(Path(sys.executable), home, tmp_path/"client.json", env={**os.environ, "MODEL_KEY": "synthetic-model-key"})
+    client = runner.CodexRunner(Path(sys.executable), home, tmp_path/"client.json", project=tmp_path/"project",
+                                env={**os.environ, "MODEL_KEY": "synthetic-model-key"})
     assert "UNRELATED_SECRET" not in client.env and client.env["MODEL_KEY"] == "synthetic-model-key"
     assert all(Path(client.env[key]) == home for key in ("CODEX_HOME", "HOME", "USERPROFILE", "APPDATA", "TEMP"))
 
@@ -141,7 +142,7 @@ def test_real_protocol_process_failure_cannot_execute_native_requests(monkeypatc
     monkeypatch.setattr(runner.proc, "popen", start)
     monkeypatch.setattr(runner.proc, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "codex-cli 0.153.1\n", ""))
     monkeypatch.setattr(runner.sendclient, "request", lambda *a: pytest.fail("native request reached broker"))
-    client = runner.CodexRunner(Path(sys.executable), home, tmp_path/"client.json", timeout_s=1)
+    client = runner.CodexRunner(Path(sys.executable), home, tmp_path/"client.json", project=tmp_path/"project", timeout_s=1)
     started = time.monotonic()
     if ending == "native":
         assert client.run("test")["status"] == "completed"

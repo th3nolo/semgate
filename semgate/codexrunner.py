@@ -100,9 +100,18 @@ def validate_runtime(config):
         raise ValueError("guarded Codex runtime has ambient capabilities")
 
 
+def validate_binary(binary: Path, project: Path) -> Path:
+    candidate = binary.resolve(strict=True)
+    if not candidate.is_file() or candidate.is_relative_to(project.resolve()):
+        raise ValueError("Codex executable must be an operator-owned file outside the project")
+    return candidate
+
+
 class CodexRunner:
-    def __init__(self, binary: Path, home: Path, connection: Path, *, timeout_s=900, env=None, event=None):
-        self.binary, self.home, self.connection = binary.resolve(), home.resolve(), connection.resolve()
+    def __init__(self, binary: Path, home: Path, connection: Path, *, project: Path, timeout_s=900, env=None, event=None):
+        self.project = project.resolve()
+        self.binary = validate_binary(binary, self.project)
+        self.home, self.connection = home.resolve(), connection.resolve()
         self.timeout = timeout_s
         if type(timeout_s) is not int or not 1 <= timeout_s <= 86400:
             raise ValueError("invalid agent deadline")
@@ -178,7 +187,9 @@ class CodexRunner:
                 return message["result"]
 
     def run(self, prompt):
-        version = proc.run([str(self.binary), "--version"], capture_output=True, text=True, check=True, timeout=10).stdout.strip()
+        self.binary = validate_binary(self.binary, self.project)
+        version = proc.run([str(self.binary), "--version"], cwd=self.home, env=self.env,
+                           capture_output=True, text=True, check=True, timeout=10).stdout.strip()
         if version != "codex-cli " + VERSION:
             raise ValueError("guarded Codex requires the validated app-server version " + VERSION)
         self.deadline = time.monotonic() + self.timeout
@@ -253,6 +264,10 @@ def main(argv=None, *, event=None, env=None):
     project, state = Path(settings["project_root"]).resolve(), args.state_dir.resolve(strict=True)
     if state.is_relative_to(project) or Path(__file__).resolve().is_relative_to(project):
         parser.error("operator runtime and Semgate installation must be outside the project")
+    try:
+        binary = validate_binary(args.codex_bin, project)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     if cfg.get("mode") != "enforce" or cfg.get("privacy_gate", {}).get("require_prepared") is not True or "development" not in settings:
         parser.error("guarded agent requires the strict prepared development profile")
     from .taskcontext import request_for
@@ -269,7 +284,8 @@ def main(argv=None, *, event=None, env=None):
         if value.get("method") in {"semgate/receipt", "item/agentMessage/delta"}:
             print(json.dumps(value), flush=True)
     try:
-        receipt = CodexRunner(args.codex_bin, home, Path(settings["client_file"]), timeout_s=args.timeout_s, event=emit, env=env).run(args.prompt)
+        receipt = CodexRunner(binary, home, Path(settings["client_file"]), project=project,
+                              timeout_s=args.timeout_s, event=emit, env=env).run(args.prompt)
         print(json.dumps(receipt))
         return 0
     except Exception as exc:

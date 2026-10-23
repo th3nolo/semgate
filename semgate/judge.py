@@ -440,6 +440,12 @@ def judge(
 
     # 1. Hard deny: grant-scope violations and denylisted commands. No model.
     hard = rules.check_hard_deny(envelope, trusted_send_client=trusted_send_client, path_view=execution_paths)
+    if hard.outcome != "deny" and execution_paths is not None:
+        # Worker paths describe execution, but cannot erase a prohibition on
+        # the canonical host action that supplied this verified mapping.
+        violations = rules.check_forbidden_patterns(identity)
+        if violations:
+            hard = rules.RuleResult(outcome="deny", rule="grant_scope", detail="; ".join(violations))
     if hard.outcome == "deny":
         return finish(Decision(
             decision="deny",

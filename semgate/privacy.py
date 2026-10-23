@@ -67,16 +67,21 @@ class PrivacyGate:
         # Payload text, commands, file paths and file contents are deliberately
         # absent. Register locally found values first to remove matching PII in
         # the user's own authorization text too.
+        categories = [{"category": k, "count": v} for k, v in inspection.cleaner.counts.items() if k != "home"]
         state = {
             "operator_purpose": envelope.grant.purpose,
             "user_requests": list(envelope.all_user_messages()),
             "proposed_disclosure": {"tool": envelope.action.tool, "destinations": inspection.destinations,
-                                    "categories": {k: v for k, v in inspection.cleaner.counts.items() if k != "home"},
                                     "inspection_complete": inspection.complete},
         }
         inspection.cleaner.clean(state)
         inspection.cleaner.nodes = 0
-        return inspection.cleaner.clean(state)
+        state = inspection.cleaner.clean(state)
+        # Counts are analyzer metadata, not values of PII fields. A mapping
+        # such as email: 1 would teach this cleaner (and SafeProvider's next
+        # pass) that the ordinary number 1 is an email address.
+        state["proposed_disclosure"]["categories"] = categories
+        return state
 
     def _consensus(self, state: Mapping[str, Any]) -> tuple:
         providers = self._providers()
